@@ -1,7 +1,8 @@
 ﻿#pragma once
-// App mixer: groups programs into strips like Voicemeeter. Each strip sets the
-// Windows volume of its programs, mutes or solos them, adds an echo
-// and can send them to the mic (B1) through a process loopback tap.
+// App mixer: groups programs into strips like Voicemeeter. Up to 0 dB a strip sets its programs' Windows volume
+// (exact, and no delay). Above it, up to +12 dB, Pixl plays them itself: the program is turned down to 0.1% where it
+// plays and its captured sound goes straight back to the same device, louder (about 46 ms later, Windows' capture).
+// Strips also mute or solo their programs, add an echo and can send them to the mic (B1).
 
 #include "../playback/program_tap.hpp"
 #include <audiopolicy.h>
@@ -16,8 +17,33 @@ constexpr int STRIPS = 3;
 constexpr int OUTS = 3;
 constexpr int MAX_APPS = 6;
 constexpr int MIN_DB10 = -600;
+constexpr int MAX_DB10 = 120;   // +12 dB: Pixl plays the program louder than it plays itself
+constexpr const wchar_t* DUCK_KEY = L"Software\\Pixl\\Mixer turned down";  // volumes to give back after a crash
 
 inline float volumeOf(int db10) { return db10 <= MIN_DB10 ? 0.0f : powf(10.0f, db10 / 200.0f); }
+
+// The fader's travel (0 bottom .. 1000 top) against dB, like a desk fader: 0 dB sits at 86%, the 6 dB under it take a
+// sixth of the travel, where the ear tells small steps apart, and the quiet end is squeezed. Straight lines between.
+struct LawPoint { int pos, db10; };
+constexpr LawPoint FADER_LAW[] = {{0, MIN_DB10}, {180, -400}, {360, -250}, {540, -140}, {720, -60}, {860, 0}, {1000, MAX_DB10}};
+constexpr int LAW_N = sizeof FADER_LAW / sizeof FADER_LAW[0];
+
+inline int faderDb10(int pos) {
+    if (pos <= 0) return MIN_DB10;
+    if (pos >= 1000) return MAX_DB10;
+    int k = 1;
+    while (FADER_LAW[k].pos < pos) ++k;
+    const LawPoint a = FADER_LAW[k - 1], b = FADER_LAW[k];
+    return a.db10 + (int)lround((double)(b.db10 - a.db10) * (pos - a.pos) / (b.pos - a.pos));
+}
+inline int faderPos(int db10) {
+    if (db10 <= MIN_DB10) return 0;
+    if (db10 >= MAX_DB10) return 1000;
+    int k = 1;
+    while (FADER_LAW[k].db10 < db10) ++k;
+    const LawPoint a = FADER_LAW[k - 1], b = FADER_LAW[k];
+    return a.pos + (int)lround((double)(b.pos - a.pos) * (db10 - a.db10) / (b.db10 - a.db10));
+}
 
 struct Strip {
     std::wstring title;
@@ -63,7 +89,9 @@ struct Mixer {
         if (wake) { CloseHandle(wake); wake = nullptr; }
     }
 
-    void poke() { if (wake) SetEvent(wake); }
+    void poke() { fullDue = true; if (wake) SetEvent(wake); }
+    // Only a fader moved: set the volumes on the sessions already found, at once, without the full scan.
+    void volumeNow() { volumeDue = true; if (wake) SetEvent(wake); }
 
     // Called by the audio thread. dry: Mic programs for the mic. Echo buses: mic: heard and on the
     // mic. mine: only heard. cab: only on the mic (Audio off).
@@ -77,11 +105,12 @@ struct Mixer {
             if (!tp.tap->active()) continue;
             tp.tap->pull(tl.data(), tr.data(), n);  // always drained, so it stays in step
             if (!tp.open) continue;
-            if (tp.dry) for (int i = 0; i < n; ++i) { dryL[i] += tl[i]; dryR[i] += tr[i]; }
+            const float g = tp.gain;
+            if (tp.dry) for (int i = 0; i < n; ++i) { dryL[i] += tl[i] * g; dryR[i] += tr[i] * g; }
             if (tp.echo) {
                 float* l = !tp.hear ? cabL : tp.b1 ? micL : mineL;
                 float* r = !tp.hear ? cabR : tp.b1 ? micR : mineR;
-                for (int i = 0; i < n; ++i) { l[i] += tl[i]; r[i] += tr[i]; }
+                for (int i = 0; i < n; ++i) { l[i] += tl[i] * g; r[i] += tr[i] * g; }
             }
         }
     }
@@ -124,7 +153,7 @@ struct Mixer {
                 // Older saves kept a percentage; the fader now works in dB.
                 const int pct = std::max(0, std::min(100, num(p + L"Gain", 100)));
                 const int fromPct = pct <= 0 ? MIN_DB10 : (int)lroundf(200.0f * log10f(pct / 100.0f));
-                s.db10 = std::max(MIN_DB10, std::min(0, num(p + L"GainDb10", fromPct)));
+                s.db10 = std::max(MIN_DB10, std::min(MAX_DB10, num(p + L"GainDb10", fromPct)));
             }
             s.mute = num(p + L"Mute", 0) != 0;
             s.solo = num(p + L"Solo", 0) != 0;
@@ -177,6 +206,9 @@ private:
         std::unique_ptr<clip::ProgramTap> tap;
         bool open = true, b1 = false, echo = false, dry = false, hear = true;
         int strip = -1;
+        bool own = false;   // Pixl plays this program itself, on dev
+        std::wstring dev;
+        float gain = 1.0f;  // the strip's level on what the tap captured (1 when Windows' volume already set it)
     };
     struct Touched {
         float firstVolume = 1.0f;
@@ -186,12 +218,15 @@ private:
     };
 
     std::thread th;
-    std::atomic<bool> quit{false};
+    std::atomic<bool> quit{false}, fullDue{false}, volumeDue{false};
     HANDLE wake = nullptr;
+    std::vector<std::pair<int, ISimpleAudioVolume*>> held;  // strip, session volume: from the last scan, for volumeNow
     int rate = 48000;
     std::mutex tapMx;
     std::map<std::wstring, Tap> taps;
     std::map<std::wstring, Touched> touched;
+    std::map<std::wstring, std::wstring> lostOn;  // program -> device its copy could not play on: Windows' volume there
+    bool above[STRIPS] = {};  // each strip was above 0 dB at the last scan (Pixl plays its programs)
     std::vector<float> tl, tr;
 
     int findStrip(const std::wstring& name) const {
@@ -211,6 +246,8 @@ private:
         std::wstring name;
         ISimpleAudioVolume* vol;
         IAudioMeterInformation* meter;
+        std::wstring dev;  // the output it plays on
+        bool active;       // playing right now
     };
 
     static std::vector<Session> sessions(const clip::ProcessTable& table) {
@@ -224,6 +261,9 @@ private:
             for (UINT i = 0; i < n; ++i) {
                 IMMDevice* d = nullptr;
                 if (FAILED(col->Item(i, &d)) || !d) continue;
+                std::wstring devId;
+                LPWSTR rawId = nullptr;
+                if (SUCCEEDED(d->GetId(&rawId)) && rawId) { devId = rawId; CoTaskMemFree(rawId); }
                 IAudioSessionManager2* mgr = nullptr;
                 if (SUCCEEDED(d->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&mgr)) && mgr) {
                     IAudioSessionEnumerator* se = nullptr;
@@ -241,7 +281,7 @@ private:
                                 sc2->GetProcessId(&pid);
                                 const std::wstring name = pid ? table.name(pid) : L"";
                                 if (!name.empty()) {
-                                    Session s{pid, name, nullptr, nullptr};
+                                    Session s{pid, name, nullptr, nullptr, devId, st == AudioSessionStateActive};
                                     sc->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&s.vol);
                                     sc->QueryInterface(__uuidof(IAudioMeterInformation), (void**)&s.meter);
                                     out.push_back(s);
@@ -293,6 +333,7 @@ private:
         }
         bool anySolo = false;
         for (const Strip& s : snap) anySolo = anySolo || s.solo;
+        for (int i = 0; i < STRIPS; ++i) above[i] = snap[i].db10 > 0;
         auto stripFor = [&](const std::wstring& name) {
             for (int i = 0; i < STRIPS; ++i)
                 for (const std::wstring& a : snap[i].apps)
@@ -303,7 +344,8 @@ private:
         // Audio off: you hear nothing. With Mic on the program plays straight into the mic
         // cable instead of your headphones, so the others still hear it.
         auto toCable = [&](int i) { return !snap[i].audio && snap[i].b1 && !silent(i); };
-        auto quiet = [&](int i) { return silent(i) || (!snap[i].audio && !snap[i].b1); };
+        auto quiet = [&](int i) { return quietIn(snap, anySolo, i); };
+        releaseHeld();
         auto needTap = [&](int i) { return i >= 0; };  // every strip program is captured: its meter comes from it
         std::wstring cable;
         for (int i = 0; i < STRIPS; ++i)
@@ -313,6 +355,27 @@ private:
         std::vector<Session> list = sessions(table);
         std::map<std::wstring, std::vector<DWORD>> pidsOf;
         std::map<std::wstring, DWORD> rootOf;
+        // Where each strip program plays (a session that is playing wins), and whether Pixl plays it itself there: only
+        // above 0 dB, and not when it goes to the mic cable (Audio off), not the program Pixl's effects already play or
+        // park, and not on a device its copy could not play on before. Those keep Windows' volume, up to 0 dB.
+        std::map<std::wstring, std::wstring> devOf;
+        std::map<std::wstring, bool> devLive, ownOf;
+        for (const Session& s : list) {
+            const std::wstring key = lower(s.name);
+            if (stripFor(s.name) < 0 || s.dev.empty()) continue;
+            if (!devOf.count(key) || (s.active && !devLive[key])) { devOf[key] = s.dev; devLive[key] = s.active; }
+        }
+        for (auto& d : devOf) {
+            const int i = stripFor(d.first);
+            auto lost = lostOn.find(d.first);
+            ownOf[d.first] = snap[i].db10 > 0 && snap[i].audio && !(!duck.empty() && sameName(d.first, duck)) && !(!skip.empty() && sameName(d.first, skip)) &&
+                             !(lost != lostOn.end() && lost->second == d.second);
+        }
+        std::map<std::wstring, bool> owned;  // a copy already plays it
+        {
+            std::lock_guard<std::mutex> lk(tapMx);
+            for (auto& t : taps) if (t.second.own && !t.second.tap->playLost.load()) owned[t.first] = true;
+        }
         for (Session& s : list) {
             const int i = stripFor(s.name);
             const std::wstring key = lower(s.name);
@@ -324,12 +387,22 @@ private:
                         float v = 1.0f;
                         s.vol->GetMasterVolume(&v);
                         seen = touched.emplace(key, Touched{}).first;
-                        seen->second.firstVolume = v;
+                        seen->second.firstVolume = clip::AppTakeover::isDucked(v) ? 1.0f : v;
                     }
-                    const float want = quiet(i) ? 0.0f : volumeOf(snap[i].db10);
-                    float have = -1.0f;
-                    s.vol->GetMasterVolume(&have);
-                    if (fabsf(have - want) > 0.004f) s.vol->SetMasterVolume(want, nullptr);
+                    if (!ownOf[key]) {
+                        const float want = quiet(i) ? 0.0f : std::min(1.0f, volumeOf(snap[i].db10));
+                        float have = -1.0f;
+                        s.vol->GetMasterVolume(&have);
+                        if (fabsf(have - want) > 0.0005f) s.vol->SetMasterVolume(want, nullptr);
+                        s.vol->AddRef();
+                        held.emplace_back(i, s.vol);
+                    } else if (!owned.count(key)) {
+                        // About to be played by Pixl: at 100% first, so the copy starts from 0 dB, where Windows'
+                        // volume left off, and +6 dB is 6 dB over that.
+                        float have = -1.0f;
+                        s.vol->GetMasterVolume(&have);
+                        if (!clip::AppTakeover::isDucked(have) && fabsf(have - 1.0f) > 0.0005f) s.vol->SetMasterVolume(1.0f, nullptr);
+                    }
                 }
                 auto& v = pidsOf[key];
                 if (std::find(v.begin(), v.end(), s.pid) == v.end()) v.push_back(s.pid);
@@ -364,12 +437,15 @@ private:
             it = touched.erase(it);
         }
 
-        // One loopback tap per strip program: it feeds the meter, and B1 and Echo when they are on.
-        std::map<std::wstring, int> wantTap;
+        // One loopback tap per strip program: it plays the program's copy (when Pixl plays it), feeds the meter, and
+        // B1 and Echo when they are on.
+        struct Want { int strip; bool own; std::wstring dev; };
+        std::map<std::wstring, Want> wantTap;
         for (auto& r : rootOf) {
             const int i = stripFor(r.first);
             if (i < 0 || !needTap(i)) continue;
-            wantTap[r.first] = i;
+            const bool own = ownOf[r.first];
+            wantTap[r.first] = Want{i, own, own ? devOf[r.first] : std::wstring()};
         }
         auto setFlags = [&](Tap& t, int i) {
             t.open = !quiet(i);
@@ -378,15 +454,22 @@ private:
             t.echo = snap[i].echo;
             t.hear = snap[i].audio;
             t.strip = i;
+            t.gain = t.own ? (quiet(i) ? 0.0f : volumeOf(snap[i].db10)) : 1.0f;
+            if (t.own) t.tap->playGain = t.gain;
         };
         std::vector<std::unique_ptr<clip::ProgramTap>> drop;
         {
             std::lock_guard<std::mutex> lk(tapMx);
-            // A tap lives until its program closes or leaves B1/Echo. A program whose sound
-            // session blinks out between two scans keeps its tap, so the echo never drops.
+            // A tap lives until its program closes or leaves B1/Echo, or Pixl starts or stops playing it, or it moves
+            // to another device. A program whose sound session blinks out between two scans keeps its tap, so the
+            // echo never drops.
             for (auto it = taps.begin(); it != taps.end();) {
                 const int i = stripFor(it->first);
-                const bool dead = it->second.tap->finished() || i < 0 || !needTap(i);
+                const auto w = wantTap.find(it->first);
+                const bool lost = it->second.own && it->second.tap->playLost.load();
+                if (lost) lostOn[it->first] = it->second.dev;
+                const bool moved = w != wantTap.end() && (w->second.own != it->second.own || w->second.dev != it->second.dev);
+                const bool dead = it->second.tap->finished() || i < 0 || !needTap(i) || moved || lost;
                 if (dead) { drop.push_back(std::move(it->second.tap)); it = taps.erase(it); }
                 else { setFlags(it->second, i); ++it; }
             }
@@ -394,9 +477,16 @@ private:
                 if (taps.count(w.first)) continue;
                 Tap t;
                 t.tap = std::make_unique<clip::ProgramTap>();
-                t.tap->handsOff = true;
-                t.tap->start(clip::Program{rootOf[w.first], w.first}, rate);
-                setFlags(t, w.second);
+                t.own = w.second.own;
+                t.dev = w.second.dev;
+                if (t.own) {
+                    t.tap->playTo = t.dev;
+                    t.tap->hijack.duckMemory.key = DUCK_KEY;
+                } else {
+                    t.tap->handsOff = true;
+                }
+                setFlags(t, w.second.strip);
+                t.tap->start(clip::Program{rootOf[w.first], w.first}, rate, L"", t.own);
                 taps.emplace(w.first, std::move(t));
             }
             b1Live = !taps.empty();
@@ -408,6 +498,8 @@ private:
             echoAny = anyEcho;
         }
         drop.clear();
+        // A copy that just stopped gave its program back its own volume: the strip's level again, at once.
+        applyVolumes();
     }
 
     // Meters come from each program's own captured sound. Windows' session meters can't be
@@ -419,13 +511,51 @@ private:
             for (auto& t : taps) {
                 const int i = t.second.strip;
                 if (i < 0 || i >= STRIPS) continue;
-                peak[i] = std::max(peak[i], t.second.tap->peakHold.exchange(0.0f));
+                peak[i] = std::max(peak[i], t.second.tap->peakHold.exchange(0.0f) * t.second.gain);
             }
         }
         for (int i = 0; i < STRIPS; ++i) level[i] = std::max(peak[i], level[i].load() * 0.75f);  // fall back smoothly
     }
 
+    static bool quietIn(const Strip* snap, bool anySolo, int i) {
+        const bool silent = snap[i].mute || (anySolo && !snap[i].solo);
+        return silent || (!snap[i].audio && !snap[i].b1);
+    }
+
+    void releaseHeld() {
+        for (auto& h : held) h.second->Release();
+        held.clear();
+    }
+
+    // The fast path while a fader moves: the sessions the last scan found get the new volume straight away.
+    void applyVolumes() {
+        Strip snap[STRIPS];
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            for (int i = 0; i < STRIPS; ++i) snap[i] = strips[i];
+        }
+        bool anySolo = false;
+        for (const Strip& s : snap) anySolo = anySolo || s.solo;
+        // A fader that crossed 0 dB changes who plays the program: that needs the full scan, straight away.
+        for (int i = 0; i < STRIPS; ++i)
+            if ((snap[i].db10 > 0) != above[i]) { fullDue = true; if (wake) SetEvent(wake); }
+        for (auto& h : held) {
+            const float want = quietIn(snap, anySolo, h.first) ? 0.0f : std::min(1.0f, volumeOf(snap[h.first].db10));
+            float have = -1.0f;
+            if (SUCCEEDED(h.second->GetMasterVolume(&have)) && fabsf(have - want) > 0.0005f) h.second->SetMasterVolume(want, nullptr);
+        }
+        // The programs Pixl plays: their copy's level, picked up by the very next packet.
+        std::lock_guard<std::mutex> lk(tapMx);
+        for (auto& t : taps) {
+            Tap& tp = t.second;
+            if (!tp.own || tp.strip < 0 || tp.strip >= STRIPS) continue;
+            tp.gain = quietIn(snap, anySolo, tp.strip) ? 0.0f : volumeOf(snap[tp.strip].db10);
+            tp.tap->playGain = tp.gain;
+        }
+    }
+
     void giveBack() {
+        releaseHeld();
         {
             std::lock_guard<std::mutex> lk(tapMx);
             taps.clear();
@@ -454,6 +584,12 @@ private:
 
     void run() {
         const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        {
+            // Programs Pixl left turned down when it did not close cleanly get their own volume back first.
+            clip::ParkMemory ducked;
+            ducked.key = DUCK_KEY;
+            clip::healDucked(ducked, {});
+        }
         ULONGLONG nextFull = 0;
         while (!quit.load()) {
             if (GetTickCount64() >= nextFull) {
@@ -462,7 +598,10 @@ private:
             } else {
                 readMeters();
             }
-            if (WaitForSingleObject(wake, 60) == WAIT_OBJECT_0) nextFull = 0;
+            if (WaitForSingleObject(wake, 60) == WAIT_OBJECT_0) {
+                if (fullDue.exchange(false)) nextFull = 0;
+                else if (volumeDue.exchange(false)) applyVolumes();
+            }
         }
         giveBack();
         if (SUCCEEDED(com)) CoUninitialize();

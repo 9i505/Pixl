@@ -18,7 +18,7 @@ FILETYPE        0x1L
       VALUE "FileDescription",  "Pixl Audio Effects Console"
       VALUE "FileVersion",      PIXL_VERSION_STR
       VALUE "InternalName",     "Pixl"
-      VALUE "LegalCopyright",   "Copyright (c) 2026 9i55"
+      VALUE "LegalCopyright",   "Copyright (c) 2026 9i505"
       VALUE "LegalTrademarks",  "Pixl"
       VALUE "OriginalFilename", "Pixl.exe"
       VALUE "ProductName",      "Pixl"

@@ -17,6 +17,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "../audio/render_feed.hpp"
+#include "../mixing/soft_clip.hpp"
 
 namespace clip {
 
@@ -870,6 +872,12 @@ struct ProgramTap {
     std::atomic<bool> parking{false};
     std::atomic<bool> ducking{false};  // the program is turned down where it plays, and this copy stands in for it
     bool handsOff = false;  // the mixer owns this program's volume, so never touch its sessions
+    // Playing the copy itself (the mixer): set before start. The program is turned down and its copy goes from the
+    // capture straight to this render device at playGain, with no other buffer between them.
+    std::wstring playTo;
+    std::atomic<float> playGain{1.0f};
+    std::atomic<float> latencyMs{0.0f};  // from the program's sound to the device playing the copy, measured
+    std::atomic<bool> playLost{false};   // the copy could not play (device gone): the program has its own sound back
     std::atomic<float> peakHold{0.0f};  // loudest sample since the meter last looked
     DWORD pid = 0;
     std::wstring name;
@@ -889,6 +897,8 @@ struct ProgramTap {
         hijack.ducking = duck && stealId.empty() && !handsOff;
         hijack.boost = 0.0f;
         ducking = hijack.ducking;
+        playLost = false;
+        latencyMs = 0.0f;
         quit = false; refusal = 0; lastSound = 0;
         ring.init((UINT32)fs, (UINT32)(fs * 40 / 1000), (UINT32)(fs * 10 / 1000));
         state = OPENING;
@@ -928,6 +938,52 @@ private:
         ~Stream() {
             if (capture) capture->Release();
             if (client) { client->Stop(); client->Release(); }
+        }
+    };
+
+    // The copy's own output: each captured packet is written to it the moment it arrives, kept 5 ms ahead of the
+    // device (more only if the device ever runs dry).
+    struct Player {
+        IAudioClient* ac = nullptr;
+        wasapi::RenderFeed feed;
+        REFERENCE_TIME streamLatency = 0;
+        std::vector<float> out;
+        float gainNow = 0.0f;
+        int fails = 0;
+        mix::SoftClip clip;
+        ~Player() { close(); }
+        void close() {
+            feed.release();
+            if (ac) { ac->Stop(); ac->Release(); ac = nullptr; }
+        }
+        bool open(const std::wstring& id, int fs) {
+            IMMDeviceEnumerator* en = nullptr;
+            if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en)) || !en)
+                return false;
+            IMMDevice* d = nullptr;
+            const HRESULT hr = en->GetDevice(id.c_str(), &d);
+            en->Release();
+            if (FAILED(hr) || !d) return false;
+            d->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac);
+            d->Release();
+            if (!ac) return false;
+            WAVEFORMATEX f{};
+            f.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+            f.nChannels = 2;
+            f.nSamplesPerSec = (DWORD)fs;
+            f.wBitsPerSample = 32;
+            f.nBlockAlign = 8;
+            f.nAvgBytesPerSec = (DWORD)fs * 8;
+            UINT32 frames = 0;
+            if (FAILED(ac->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                      400000, 0, &f, nullptr)) ||
+                FAILED(ac->GetBufferSize(&frames)) || !feed.attach(ac, frames, (UINT32)(fs * 5 / 1000), (UINT32)(fs / 1000))) {
+                close();
+                return false;
+            }
+            ac->GetStreamLatency(&streamLatency);
+            ac->Start();
+            return true;
         }
     };
 
@@ -972,7 +1028,7 @@ private:
         return hr;
     }
 
-    bool drain(IAudioCaptureClient* capture) {
+    bool drain(IAudioCaptureClient* capture, Player* play, int fs) {
         UINT32 pk = 0;
         for (;;) {
             if (FAILED(capture->GetNextPacketSize(&pk))) return false;
@@ -980,7 +1036,8 @@ private:
             BYTE* data = nullptr;
             UINT32 n = 0;
             DWORD flags = 0;
-            if (FAILED(capture->GetBuffer(&data, &n, &flags, nullptr, nullptr))) return false;
+            UINT64 qpc = 0;
+            if (FAILED(capture->GetBuffer(&data, &n, &flags, nullptr, &qpc))) return false;
             const float* s = (flags & AUDCLNT_BUFFERFLAGS_SILENT) ? nullptr : (const float*)data;
             float peak = 0.0f;
             if (s) {
@@ -999,6 +1056,7 @@ private:
                 s = lifted.data();
                 peak *= gain;
             }
+            if (play && play->ac && n) playCopy(*play, s, n, qpc, fs);
             if (!s || n == 0 || peak < 1e-7f) {
                 if (silence.size() < (size_t)n * 2) silence.assign((size_t)n * 2, 0.f);
                 ring.push(silence.data(), n);
@@ -1009,6 +1067,34 @@ private:
                 ring.push(s, n);
             }
             capture->ReleaseBuffer(n);
+        }
+    }
+
+    // The copy at the mixer's level: the gain glides across the packet, and a soft knee keeps a boost from clipping.
+    void playCopy(Player& p, const float* s, UINT32 n, UINT64 qpc, int fs) {
+        const float want = playGain.load(), from = p.gainNow, step = (want - from) / (float)n;
+        p.out.resize((size_t)n * 2);
+        for (UINT32 i = 0; i < n; ++i) {
+            const float g = from + step * (float)(i + 1);
+            float l = s ? s[2 * i] * g : 0.0f, r = s ? s[2 * i + 1] * g : 0.0f;
+            p.clip.process(l, r);
+            p.out[2 * i] = l;
+            p.out[2 * i + 1] = r;
+        }
+        p.gainNow = want;
+        if (!p.feed.push(p.out.data(), n)) {
+            if (++p.fails > 20) { p.close(); playLost = true; }
+            return;
+        }
+        p.fails = 0;
+        // How late the copy is: the packet's age, what is queued ahead of it, and the device's own delay.
+        UINT32 pad = 0;
+        LARGE_INTEGER now, freq;
+        if (qpc && SUCCEEDED(p.ac->GetCurrentPadding(&pad)) && QueryPerformanceCounter(&now) && QueryPerformanceFrequency(&freq)) {
+            const double age = (double)now.QuadPart * 1e7 / (double)freq.QuadPart - (double)qpc;
+            const double ms = age / 1e4 + 1000.0 * ((double)pad - (double)n) / fs + p.streamLatency / 1e4;
+            const float was = latencyMs.load();
+            latencyMs = was == 0.0f ? (float)ms : was + 0.05f * ((float)ms - was);
         }
     }
 
@@ -1028,6 +1114,12 @@ private:
         };
         int end = GONE;
         if (!wake) { refusal = (long)HRESULT_FROM_WIN32(GetLastError()); end = REFUSED; }
+        Player player;
+        Player* play = nullptr;
+        if (!playTo.empty()) {
+            if (player.open(playTo, fs)) play = &player;
+            else { hijack.ducking = false; ducking = false; playLost = true; }  // nowhere to play the copy: leave it alone
+        }
         bool everOpened = false;
         while (wake && !quit.load() && alive()) {
             Stream s;
@@ -1042,7 +1134,7 @@ private:
             state = CAPTURING;
             while (!quit.load() && alive()) {
                 WaitForSingleObject(wake, 100);
-                if (!drain(s.capture)) break;
+                if (!drain(s.capture, play && play->ac ? play : nullptr, fs)) break;
             }
             state = OPENING;
         }
@@ -1057,6 +1149,11 @@ private:
         const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         ULONGLONG due = 0;
         while (!quit.load() && !finished()) {
+            if (playLost.load() && hijack.ducking) {
+                hijack.restore();
+                hijack.ducking = false;
+                ducking = false;
+            }
             const ULONGLONG now = GetTickCount64();
             if (state.load() != CAPTURING) due = 0;
             else if (!handsOff && (now >= due || (now + 1750 >= due && hijack.rescan.exchange(false)))) {

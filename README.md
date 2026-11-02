@@ -20,8 +20,14 @@
 ### المميزات
 
 - **مؤثرات الصوت:** صدى مكان (Concert Hall وCathedral وHaunted Cavern وغيرها)، وتغيير الصوت (Voice mask)، وعزل الضوضاء، وإيكولايزر 7 نطاقات.
+- **إلغاء الضوضاء بالذكاء الاصطناعي (AI):** مرتّب مثل صفحة المايك في SteelSeries Sonar. اختر **AI** تحت Noise isolation، وزر الترس يفتح نافذة Noise Cancellation:
+  - **AI Noise Cancellation:** شبكة عصبية (RNNoise) تشيل المروحة والمكيف والكيبورد والضجة وتخلي صوتك، من Min إلى Max.
+  - **Noise Reduction:** ‏Background للضوضاء الثابتة و Impact للأصوات المفاجئة مثل الكيبورد والماوس. تشتغل لما يكون الـ AI طافي.
+  - **Noise Gate:** يقفل المايك بين الكلام تحت الـ Threshold بالـ dB، أو خله يحسب الـ Threshold من الغرفة بنفسه.
+  - **Compressor:** يقرّب الصوت العالي من الواطي، بـ Level من 0.00 إلى 1.00.
+  التفاصيل في [docs/mic.md](docs/mic.md).
 - **المكسر (Mixer):** حط برامجك في أعمدة (Audio 1 و 2 و 3)، ولكل عمود:
-  - **Fader** للصوت بالـ dB (من ‎-60 إلى 0)، مع عدّاد يمشي مع صوت البرنامج نفسه.
+  - **Fader** للصوت بالـ dB من ‎-60 إلى ‎+12، مثل فيدر الميكسر، والعلامة جنبه هي 0 dB. لين 0 dB يتحكم Windows بصوت البرنامج (دقيق وبدون أي تأخير). فوق 0 dB يشغّل Pixl البرنامج بنفسه وأعلى من صوته الأصلي (يتأخر حوالي 46 ms بسبب طريقة Windows في التقاط صوت البرامج). تحته الرقم بالـ dB (اضغطه واكتب الرقم)، وجنبه المستوى بالنسبة (100% عند 0 dB). ‏Shift مع السحب أو العجلة للتحكم الدقيق. ومعه عدّاد يمشي مع صوت البرنامج نفسه.
   - **Audio:** تسمع البرنامج أو لا.
   - **Mic:** يطلع صوت البرنامج في مايكك.
   - **Echo:** يضيف صدى على صوت البرنامج.
@@ -86,8 +92,14 @@
 ### Features
 
 - **Voice effects:** room echo (Concert Hall, Cathedral, Haunted Cavern and more), voice masks, noise isolation and a 7-band equalizer.
+- **AI noise cancellation:** laid out like the mic page of SteelSeries Sonar. Pick **AI** under Noise isolation; the cog opens the Noise Cancellation window:
+  - **AI Noise Cancellation:** a neural network (RNNoise) that takes out fans, air conditioning, keyboards and room noise and keeps your voice, from Min to Max.
+  - **Noise Reduction:** Background for steady noise and Impact for sudden sounds like keys and mouse clicks. Works while the AI is off.
+  - **Noise Gate:** shuts the mic between words below a Threshold in dB, or sets the threshold from the room by itself.
+  - **Compressor:** brings loud and quiet speech closer, with a Level from 0.00 to 1.00.
+  How it works and how it was tested: [docs/mic.md](docs/mic.md).
 - **Mixer:** put programs on strips (Audio 1, 2, 3). Each strip has:
-  - a **fader** in dB (-60 to 0) and a meter that follows the program's own sound,
+  - a **fader** in dB from -60 to +12, shaped like a desk fader, with a mark at 0 dB. Up to 0 dB it sets the program's Windows volume (exact, no delay). Above 0 dB Pixl plays the program itself, louder than it plays by itself (about 46 ms later, from the way Windows captures a program's sound). Under it the dB (click it to type one), beside it the level as a share (100% at 0 dB). Hold Shift while dragging or scrolling for fine steps. A meter follows the program's own sound,
   - **Audio:** hear the program or not,
   - **Mic:** send the program into your mic,
   - **Echo:** add the room echo to the program,
@@ -175,4 +187,4 @@ Shows, per release, downloads of `Pixl.zip` (from the releases page) and of `Pix
 
 ## License
 
-MIT License. Copyright (c) 2026 9i55. See [LICENSE](LICENSE).
+MIT License. Copyright (c) 2026 9i505. See [LICENSE](LICENSE).

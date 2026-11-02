@@ -57,6 +57,7 @@ using std::max; using std::min;
 #include "equalizer/bass_boost.hpp"
 #include "equalizer/eq_presets.hpp"
 #include "equalizer/graphic_equalizer.hpp"
+#include "isolation/mic_chain.hpp"
 #include "isolation/expander_gate.hpp"
 #include "isolation/voice_isolator.hpp"
 #include "mixing/amount_law.hpp"
@@ -269,8 +270,16 @@ static const int EIGHT_MAX = 200;         // 8D Audio's Bass, Clarity and Echo g
 static const int GATE_DEFAULT_DB = -170, GATE_OLD_LEVEL = 60, GATE_MIN_DB = -660, VOCAL_DEFAULT_LEVEL = iso::GATE_LEVEL_NORMAL;
 static const int GATE_DEFAULT_TONE = 120, GATE_DEFAULT_OUT = -50, GATE_TONE_RANGE = 120;
 static const int TONE_RANGE = 240, TONE_SAVED_ZERO = 120, TONE_PAD_RANGE = 100;
-static const int ISO_VOCAL = iso::NUM_MODES, ISO_MODES = iso::NUM_MODES + 1;
-static const int ISO_ORDER[ISO_MODES] = {ISO_VOCAL, 0, 1, 2, 3};
+static const int ISO_VOCAL = iso::NUM_MODES, ISO_AI = iso::NUM_MODES + 1, ISO_MODES = iso::NUM_MODES + 2;
+static const int ISO_ORDER[ISO_MODES] = {ISO_AI, ISO_VOCAL, 0, 1, 2, 3};
+// Pixl starts where SteelSeries Sonar was measured on the same voice: the AI at Max, the gate at -40 dB, the compressor
+// at 0.50 and Sonar match on.
+static iso::MicSettings micDefaults() {
+    iso::MicSettings s;
+    s.aiLevel = 100; s.gateOn = true; s.gateDb10 = -400; s.compOn = true; s.compLevel = 50; s.matchOn = true;
+    return s;
+}
+static const iso::MicSettings MIC_DEFAULTS = micDefaults();
 
 struct Shared {
     std::atomic<int> micLevel{MIC_DEFAULT};
@@ -295,8 +304,26 @@ struct Shared {
     std::atomic<int>  eqPreset{0};
     std::atomic<int>  eqVersion{0};
     std::atomic<bool> isolate{false};
-    std::atomic<int>  isoMode{ISO_VOCAL};
+    std::atomic<int>  isoMode{ISO_AI};
     std::atomic<int>  isoLevel{ISO_DEFAULT};
+    // The AI mode's mic chain (Sonar-style): AI noise cancellation, noise reduction, noise gate, compressor.
+    std::atomic<bool> aiOn{MIC_DEFAULTS.aiOn};
+    std::atomic<int>  aiLevel{MIC_DEFAULTS.aiLevel};
+    std::atomic<bool> nrBgOn{MIC_DEFAULTS.bgOn};
+    std::atomic<int>  nrBg{MIC_DEFAULTS.bg};
+    std::atomic<bool> nrImpactOn{MIC_DEFAULTS.impactOn};
+    std::atomic<int>  nrImpact{MIC_DEFAULTS.impact};
+    std::atomic<bool> micGateOn{MIC_DEFAULTS.gateOn};
+    std::atomic<int>  micGateDb10{MIC_DEFAULTS.gateDb10};
+    std::atomic<bool> micGateAuto{MIC_DEFAULTS.gateAuto};
+    std::atomic<bool> compOn{MIC_DEFAULTS.compOn};
+    std::atomic<bool> micMatch{MIC_DEFAULTS.matchOn};
+    std::atomic<int>  compLevel{MIC_DEFAULTS.compLevel};
+    // What the chain measures, for its window.
+    std::atomic<float> micIn{-120.0f}, micOut{-120.0f}, micAiCut{0.0f}, micVoice{0.0f}, micGateDb{-50.0f}, micCompGr{0.0f};
+    std::atomic<bool> micGateOpen{true};
+    std::atomic<float> micWave[iso::MicChain::WAVE]{};
+    std::atomic<int>  micWaveAt{0};
     std::atomic<int>  gateLevel{VOCAL_DEFAULT_LEVEL};
     std::atomic<int>  gateLo{GATE_DEFAULT_TONE};
     std::atomic<int>  gateMid{GATE_DEFAULT_TONE};
@@ -388,8 +415,39 @@ static iso::GateShape gateShape() {
     return s;
 }
 static bool vocalOn() { return g.isolate.load() && g.isoMode.load() == ISO_VOCAL; }
-static std::atomic<int>& isoFader() { return g.isoMode.load() == ISO_VOCAL ? g.gateLevel : g.isoLevel; }
-static const wchar_t* isoModeName(int m) { return m == ISO_VOCAL ? L"Vocal" : iso::MODE_NAME[m < 0 ? 0 : (m >= iso::NUM_MODES ? iso::NUM_MODES - 1 : m)]; }
+static bool aiModeOn() { return g.isolate.load() && g.isoMode.load() == ISO_AI; }
+static std::atomic<int>& isoFader() {
+    const int m = g.isoMode.load();
+    return m == ISO_VOCAL ? g.gateLevel : (m == ISO_AI ? g.aiLevel : g.isoLevel);
+}
+static const wchar_t* isoModeName(int m) {
+    if (m == ISO_VOCAL) return L"Vocal";
+    if (m == ISO_AI) return L"AI";
+    return iso::MODE_NAME[m < 0 ? 0 : (m >= iso::NUM_MODES ? iso::NUM_MODES - 1 : m)];
+}
+static iso::MicSettings micSettings() {
+    iso::MicSettings s;
+    s.aiOn = g.aiOn.load(); s.aiLevel = g.aiLevel.load();
+    s.bgOn = g.nrBgOn.load(); s.bg = g.nrBg.load();
+    s.impactOn = g.nrImpactOn.load(); s.impact = g.nrImpact.load();
+    s.gateOn = g.micGateOn.load(); s.gateDb10 = g.micGateDb10.load(); s.gateAuto = g.micGateAuto.load();
+    s.compOn = g.compOn.load(); s.compLevel = g.compLevel.load();
+    s.matchOn = g.micMatch.load();
+    return s;
+}
+// Hands what the mic chain measured to its window.
+static void micPublish(const iso::MicChain& c) {
+    const auto r = std::memory_order_relaxed;
+    g.micIn.store(c.meterIn.load(r), r);
+    g.micOut.store(c.meterOut.load(r), r);
+    g.micAiCut.store(c.meterAiCut.load(r), r);
+    g.micVoice.store(c.meterVoice.load(r), r);
+    g.micGateDb.store(c.meterGateDb.load(r), r);
+    g.micGateOpen.store(c.meterGateOpen.load(r), r);
+    g.micCompGr.store(c.meterCompGr.load(r), r);
+    for (int i = 0; i < iso::MicChain::WAVE; ++i) g.micWave[i].store(c.wave[i].load(r), r);
+    g.micWaveAt.store(c.waveAt.load(r), r);
+}
 
 static const wchar_t* CABLE_SERVICE =
     L"SYSTEM\\CurrentControlSet\\Services\\VBAudioVACMME";
@@ -1059,6 +1117,9 @@ static void audioThread() {
     WetPeak wetPeak;
     iso::VoiceIsolator isolator;
     isolator.prepare(FS);
+    const auto micChainBox = std::make_unique<iso::MicChain>();
+    iso::MicChain& micChain = *micChainBox;
+    micChain.prepare(FS);
     iso::ExpanderGate presetGate;
     presetGate.prepare(FS);
     voice::VoiceTone voiceTone;
@@ -1114,6 +1175,10 @@ static void audioThread() {
     bool isoWas = false, vocalWas = false;
     int isoSeen = -1, vocalSeen = -1, toneSeen = -1;
     float isoGain = 0.0f, toneGain = 0.0f;
+    // The AI mode's chain starts over whenever it is switched on or the mic is opened again.
+    bool micChainWas = false;
+    int micChainSeen = -1;
+    float micChainGain = 0.0f;
     OutChain voiceMon, voiceCab, progMon, progCab;
     OutChain* const chains[] = {&voiceMon, &voiceCab, &progMon, &progCab};
     for (OutChain* c : chains) c->prepare(FS);
@@ -1151,7 +1216,7 @@ static void audioThread() {
         mixCab.forget();
         coreLive = slapLive = false;
         coreTail = loudStageTail = songTail = appTail = 0;
-        isoWas = shaperWas = clipChanging = appChanging = songBusWas = false;
+        isoWas = micChainWas = shaperWas = clipChanging = appChanging = songBusWas = false;
         voicePace.reset();
         clipPace.reset();
         g.voiceLagMs = 0;
@@ -1211,6 +1276,7 @@ static void audioThread() {
             }
             g.running = true;
             g.reopenMic = false;
+            micChainWas = false;
             gApp.resync();
             if (lastBlockAt && GetTickCount64() - lastBlockAt > ROOMS_KEEP_MS) forgetRooms();
 
@@ -1344,7 +1410,22 @@ static void audioThread() {
                         if (!vocalWas) { presetGate.reset(); vocalWas = true; }
                         presetGate.process(mono.data(), (int)frames);
                     } else vocalWas = false;
-                    if (g.isolate.load() && !vocal) {
+                    const bool clear = aiModeOn();
+                    if (clear) {
+                        if (micChainSeen != g.isoVersion.load()) {
+                            micChainSeen = g.isoVersion.load();
+                            micChain.configure(micSettings());
+                        }
+                        if (!micChainWas) { micChain.reset(); micChainWas = true; micChainGain = micGain; }
+                        if (micGain > 0.0f && micGain != micChainGain) {
+                            if (micChainGain > 0.0f) micChain.shiftLevel(20.0 * log10((double)micGain / micChainGain));
+                            micChainGain = micGain;
+                        }
+                        if (pass == 1 && inputTap.poll()) micChain.inputHint();
+                        micChain.process(mono.data(), (int)frames);
+                        if (pass == 1) micPublish(micChain);
+                    } else micChainWas = false;
+                    if (g.isolate.load() && !vocal && !clear) {
                         if (!isoWas) { isolator.reset(); isoWas = true; isoGain = micGain; }
                         if (isoSeen != g.isoVersion.load()) {
                             isoSeen = g.isoVersion.load();
@@ -2494,6 +2575,8 @@ static void centredText(HDC dc, const RECT& r, const wchar_t* s, COLORREF c, HFO
 static void toneSettle();
 static void openToneBox(HWND owner);
 static HWND hTone = nullptr;
+static void openMicBox(HWND owner);
+static HWND hMicWin = nullptr;
 static void showAbout(HWND owner);
 
 enum { ID_MIC = 101, ID_SPK, ID_PRESET };
@@ -3069,7 +3152,7 @@ static void noTheme(HWND h) { SetWindowTheme(h, L"", L""); }
 enum Icon { ICO_NONE = -1, ICO_PLAY, ICO_PAUSE, ICO_STOP, ICO_OPEN, ICO_BACK, ICO_FWD, ICO_PREV, ICO_NEXT,
             ICO_CLOSE, ICO_MIN, ICO_LOOK, ICO_SAVE, ICO_TRASH, ICO_KEY, ICO_RESET, ICO_LOOP, ICO_WARN, ICO_CUT, ICO_REFRESH,
             ICO_PAD, ICO_NOISE_OFF, ICO_POWER, ICO_WAND, ICO_HEADPHONES, ICO_WIDE, ICO_MIC, ICO_CUBE, ICO_PERSON, ICO_NOTE,
-            ICO_WINDOW, ICO_MASK, ICO_TUNING, ICO_SEND, ICO_GAUGE, ICO_LOCK, ICO_CHIP, ICO_BARS, ICO_SPEAKER, ICO_BOLT, ICO_ROOM, ICO_STAR, ICO_LINK, ICO_RECORD, ICO_WAVE, ICO_UNDO, ICO_HUSH, ICO_REDO, ICO_PRESETS };
+            ICO_WINDOW, ICO_MASK, ICO_TUNING, ICO_SEND, ICO_GAUGE, ICO_LOCK, ICO_CHIP, ICO_BARS, ICO_SPEAKER, ICO_BOLT, ICO_ROOM, ICO_STAR, ICO_LINK, ICO_RECORD, ICO_WAVE, ICO_UNDO, ICO_HUSH, ICO_REDO, ICO_PRESETS, ICO_GEAR };
 
 static const COLORREF RECORD_RED = RGB(236, 72, 84);
 static void drawIcon(HDC dc, float cx, float cy, int icon, COLORREF c, COLORREF bg);
@@ -4395,6 +4478,18 @@ static void drawIcon(HDC dc, float cx, float cy, int icon, COLORREF c, COLORREF 
             gr.DrawLine(i == 1 ? &bold : &pen, cx - 1.0f, y, cx + 7.0f, y);
         }
         break;
+    case ICO_GEAR: {
+        // A cog: eight teeth round a wheel, with a hole in the middle.
+        Gdiplus::PointF p[32];
+        for (int k = 0; k < 8; ++k) {
+            const float a = k * 0.785398f, in = 4.9f, out = 7.0f;
+            const float at[4] = {a - 0.30f, a - 0.17f, a + 0.17f, a + 0.30f}, r[4] = {in, out, out, in};
+            for (int j = 0; j < 4; ++j) p[k * 4 + j] = Gdiplus::PointF(cx + r[j] * cosf(at[j]), cy + r[j] * sinf(at[j]));
+        }
+        gr.FillPolygon(&br, p, 32);
+        gr.FillEllipse(&hole, cx - 2.4f, cy - 2.4f, 4.8f, 4.8f);
+        break;
+    }
     case ICO_RECORD: {
         Gdiplus::SolidBrush red(gpColor(c == C_OFF ? c : RECORD_RED));
         gr.FillEllipse(&red, cx - 5.0f, cy - 5.0f, 10.0f, 10.0f);
@@ -5664,7 +5759,8 @@ static const RECT R_ISOLATE = {110, TITLE_H + 80, 236, TITLE_H + 95};
 static const RECT R_STARTUP  = {110, TITLE_H + 108, 420, TITLE_H + 123};
 static const RECT R_ISO_PREV = {252, TITLE_H + 77, 272, TITLE_H + 97};
 static const RECT R_ISO_NEXT = {336, TITLE_H + 77, 356, TITLE_H + 97};
-static const RECT R_ISOLVL   = {372, TITLE_H + 76, 502, TITLE_H + 98};
+static const RECT R_ISOLVL   = {372, TITLE_H + 76, 470, TITLE_H + 98};
+static const RECT R_ISO_SET  = {514, TITLE_H + 77, 540, TITLE_H + 97};  // settings of the mode: the AI's Noise Cancellation window, Vocal's Tone window
 static bool dragIso = false;
 static const wchar_t* SETTINGS_KEY = L"Software\\Pixl\\Settings";
 static int presetTop = -1;
@@ -5694,6 +5790,19 @@ static void settingsSave() {
     put(L"Isolation", g.isolate.load() ? 1 : 0);
     put(L"IsoMode", g.isoMode.load());
     put(L"IsoLevel", g.isoLevel.load());
+    put(L"AiOn", g.aiOn.load() ? 1 : 0);
+    put(L"AiLevel", g.aiLevel.load());
+    put(L"NrBackgroundOn", g.nrBgOn.load() ? 1 : 0);
+    put(L"NrBackground", g.nrBg.load());
+    put(L"NrImpactOn", g.nrImpactOn.load() ? 1 : 0);
+    put(L"NrImpact", g.nrImpact.load());
+    put(L"MicGateOn", g.micGateOn.load() ? 1 : 0);
+    put(L"MicGateDb", g.micGateDb10.load() + 800);   // tenths of a dB, -80..0 dB saved as 0..800
+    put(L"MicGateAuto", g.micGateAuto.load() ? 1 : 0);
+    put(L"CompOn", g.compOn.load() ? 1 : 0);
+    put(L"CompLevel", g.compLevel.load());
+    put(L"MicMatch", g.micMatch.load() ? 1 : 0);
+    put(L"MicMatchSet", 1);
     put(L"VocalLevel", g.gateLevel.load());
     put(L"GateLo", g.gateLo.load() + GATE_TONE_RANGE);
     put(L"GateMid", g.gateMid.load() + GATE_TONE_RANGE);
@@ -5797,8 +5906,26 @@ static void settingsLoad() {
     if (std::find(std::begin(KEEP_STEPS), std::end(KEEP_STEPS), keepSec) == std::end(KEEP_STEPS)) keepSec = KEEP_DEFAULT_SEC;
     lastQuiet = get(L"LastQuiet", 0, 1, 1) != 0;
     presetTop = get(L"PresetTop", 0, NUM_CARD_PRESETS - 1, -1);
-    g.isoMode  = get(L"IsoMode", 0, ISO_MODES - 1, ISO_VOCAL);
+    g.isoMode  = get(L"IsoMode", 0, ISO_MODES - 1, ISO_AI);
     g.isoLevel = get(L"IsoLevel", 0, 100, ISO_DEFAULT);
+    g.aiOn = get(L"AiOn", 0, 1, MIC_DEFAULTS.aiOn ? 1 : 0) != 0;
+    g.aiLevel = get(L"AiLevel", 0, 100, MIC_DEFAULTS.aiLevel);
+    g.nrBgOn = get(L"NrBackgroundOn", 0, 1, MIC_DEFAULTS.bgOn ? 1 : 0) != 0;
+    g.nrBg = get(L"NrBackground", 0, 100, MIC_DEFAULTS.bg);
+    g.nrImpactOn = get(L"NrImpactOn", 0, 1, MIC_DEFAULTS.impactOn ? 1 : 0) != 0;
+    g.nrImpact = get(L"NrImpact", 0, 100, MIC_DEFAULTS.impact);
+    g.micGateOn = get(L"MicGateOn", 0, 1, MIC_DEFAULTS.gateOn ? 1 : 0) != 0;
+    g.micGateDb10 = get(L"MicGateDb", 0, 800, MIC_DEFAULTS.gateDb10 + 800) - 800;
+    g.micGateAuto = get(L"MicGateAuto", 0, 1, MIC_DEFAULTS.gateAuto ? 1 : 0) != 0;
+    g.compOn = get(L"CompOn", 0, 1, MIC_DEFAULTS.compOn ? 1 : 0) != 0;
+    g.compLevel = get(L"CompLevel", 0, 100, MIC_DEFAULTS.compLevel);
+    g.micMatch = get(L"MicMatch", 0, 1, MIC_DEFAULTS.matchOn ? 1 : 0) != 0;
+    if (get(L"MicMatchSet", 0, 1, 0) == 0) {
+        // Once, when Sonar match arrives: the measured Sonar settings, over what the AI mode had before.
+        g.aiLevel = MIC_DEFAULTS.aiLevel; g.micGateOn = MIC_DEFAULTS.gateOn; g.micGateDb10 = MIC_DEFAULTS.gateDb10;
+        g.micGateAuto = MIC_DEFAULTS.gateAuto; g.compOn = MIC_DEFAULTS.compOn; g.compLevel = MIC_DEFAULTS.compLevel;
+        g.micMatch = MIC_DEFAULTS.matchOn;
+    }
     const int oldGateLevel = get(L"GateLevel", 0, 100, -1), oldGateDb = get(L"GateDb", 0, -GATE_MIN_DB, -1);
     g.gateLevel = get(L"VocalLevel", 0, 100, oldGateLevel >= 0 ? vocalLevelOfOld(oldGateLevel) : (oldGateDb >= 0 ? vocalLevelOfThreshold(oldGateDb + GATE_MIN_DB) : VOCAL_DEFAULT_LEVEL));
     const bool chainWasOn = get(L"MixOn", 0, 1, 0) != 0;
@@ -6045,6 +6172,11 @@ static bool settingsFileSave(const std::wstring& path) {
     fprintf(f, "effects=%d\necho_on=%d\nmask_on=%d\nmonitor=%d\nwide=%d\nraw=%d\ncmss=%d\ncard_mic=%d\n", g.enabled.load() ? 1 : 0, g.echoOn.load(), g.changeOn.load(), g.monitor.load() ? 1 : 0,
             g.wide.load() ? 1 : 0, g.rawMic.load() ? 1 : 0, g.cmss.load() ? 1 : 0, g.cardMic.load() ? 1 : 0);
     fprintf(f, "isolate=%d\niso_mode=%d\niso_level=%d\n", g.isolate.load() ? 1 : 0, g.isoMode.load(), g.isoLevel.load());
+    fprintf(f, "ai_on=%d\nai_level=%d\nnr_background_on=%d\nnr_background=%d\nnr_impact_on=%d\nnr_impact=%d\n", g.aiOn.load() ? 1 : 0, g.aiLevel.load(),
+            g.nrBgOn.load() ? 1 : 0, g.nrBg.load(), g.nrImpactOn.load() ? 1 : 0, g.nrImpact.load());
+    fprintf(f, "mic_gate_on=%d\nmic_gate_db10=%d\nmic_gate_auto=%d\ncomp_on=%d\ncomp_level=%d\n", g.micGateOn.load() ? 1 : 0, g.micGateDb10.load(),
+            g.micGateAuto.load() ? 1 : 0, g.compOn.load() ? 1 : 0, g.compLevel.load());
+    fprintf(f, "mic_match=%d\n", g.micMatch.load() ? 1 : 0);
     fprintf(f, "vocal_level=%d\ngate_lo=%d\ngate_mid=%d\ngate_hi=%d\ngate_out=%d\n", g.gateLevel.load(), g.gateLo.load(), g.gateMid.load(), g.gateHi.load(), g.gateOut.load());
     fprintf(f, "tone_on=%d\ntone_lo=%d\ntone_mid=%d\ntone_hi=%d\ntone_pad_x=%d\ntone_pad_y=%d\ntone_base_lo=%d\ntone_base_mid=%d\ntone_base_hi=%d\n", g.toneOn.load() ? 1 : 0,
             g.toneLo.load(), g.toneMid.load(), g.toneHi.load(), g.tonePadX.load(), g.tonePadY.load(), g.toneBaseLo.load(), g.toneBaseMid.load(), g.toneBaseHi.load());
@@ -6123,6 +6255,18 @@ static void settingsFileLoad(const std::wstring& path) {
         else if (k == "cmss")      g.cmss = iv != 0;
         else if (k == "iso_mode")  { g.isoMode = clampi(iv, 0, ISO_MODES - 1); g.isoVersion.fetch_add(1); }
         else if (k == "iso_level") { g.isoLevel = clampi(iv, 0, 100); g.isoVersion.fetch_add(1); }
+        else if (k == "ai_on")            { g.aiOn = iv != 0; g.isoVersion.fetch_add(1); }
+        else if (k == "ai_level")         { g.aiLevel = clampi(iv, 0, 100); g.isoVersion.fetch_add(1); }
+        else if (k == "nr_background_on") { g.nrBgOn = iv != 0; g.isoVersion.fetch_add(1); }
+        else if (k == "nr_background")    { g.nrBg = clampi(iv, 0, 100); g.isoVersion.fetch_add(1); }
+        else if (k == "nr_impact_on")     { g.nrImpactOn = iv != 0; g.isoVersion.fetch_add(1); }
+        else if (k == "nr_impact")        { g.nrImpact = clampi(iv, 0, 100); g.isoVersion.fetch_add(1); }
+        else if (k == "mic_gate_on")      { g.micGateOn = iv != 0; g.isoVersion.fetch_add(1); }
+        else if (k == "mic_gate_db10")    { g.micGateDb10 = clampi(iv, -800, 0); g.isoVersion.fetch_add(1); }
+        else if (k == "mic_gate_auto")    { g.micGateAuto = iv != 0; g.isoVersion.fetch_add(1); }
+        else if (k == "comp_on")          { g.compOn = iv != 0; g.isoVersion.fetch_add(1); }
+        else if (k == "comp_level")       { g.compLevel = clampi(iv, 0, 100); g.isoVersion.fetch_add(1); }
+        else if (k == "mic_match")        { g.micMatch = iv != 0; g.isoVersion.fetch_add(1); }
         else if (k == "mix_on" && iv) { g.isolate = true; g.isoMode = ISO_VOCAL; g.isoVersion.fetch_add(1); }
         else if (k == "gate_db")   { g.gateLevel = vocalLevelOfThreshold(iv); g.isoVersion.fetch_add(1); }
         else if (k == "gate_level") { g.gateLevel = vocalLevelOfOld(iv); g.isoVersion.fetch_add(1); }
@@ -6220,6 +6364,7 @@ static void settingsFileLoad(const std::wstring& path) {
     toneSettle();
     g.toneVersion.fetch_add(1);
     if (hTone) InvalidateRect(hTone, nullptr, FALSE);
+    if (hMicWin) InvalidateRect(hMicWin, nullptr, FALSE);
     showMask();
     showGlitch();
     settingsSave();
@@ -7888,6 +8033,368 @@ static void openToneBox(HWND owner) {
     SetForegroundWindow(hTone);
 }
 
+// The AI mode's window, laid out like SteelSeries Sonar's mic page: AI noise cancellation (Min to Max) on top; Noise
+// reduction (Background, Impact), off while the AI is on; Noise gate with its threshold; Compressor; and live levels.
+static int micHot = -1, micDrag = -1, micState = -1;
+static bool micMouse = false;
+static float micShowIn = -120.0f, micShowOut = -120.0f, micShowCut = 0.0f;
+static const int MW_W = 760, MW_H = 500, MW_MID = MW_W / 2;
+static const RECT MC_CLOSE   = {MW_W - 34, 5, MW_W - 8, 29};
+static const RECT MC_AI      = {12, 46, MW_W - 12, 156};
+static const RECT MC_AI_ON   = {24, 58, 330, 76};
+static const RECT MC_MATCH   = {MW_W - 236, 58, MW_W - 24, 76};  // Sonar match
+static const RECT MC_WAVE    = {24, 88, 300, 144};
+static const RECT MC_AI_FADER = {366, 105, MW_W - 76, 127};
+static const RECT MC_NR      = {12, 166, MW_MID - 6, 336};
+static const RECT MC_BG_ON   = {24, 244, 64, 262};
+static const RECT MC_BG      = {150, 242, MW_MID - 92, 264};
+static const RECT MC_IMP_ON  = {24, 290, 64, 308};
+static const RECT MC_IMP     = {150, 288, MW_MID - 92, 310};
+static const RECT MC_GATE    = {MW_MID + 6, 166, MW_W - 12, 336};
+static const RECT MC_GATE_ON = {MW_MID + 18, 178, MW_W - 60, 196};
+static const RECT MC_GATE_TH = {MW_MID + 120, 242, MW_W - 100, 264};
+static const RECT MC_GATE_AUTO = {MW_MID + 18, 290, MW_W - 24, 305};
+static const RECT MC_COMP    = {12, 346, MW_MID - 6, MW_H - 12};
+static const RECT MC_COMP_ON = {24, 358, 330, 376};
+static const RECT MC_COMP_L  = {150, 418, MW_MID - 92, 440};
+static const RECT MC_LIVE    = {MW_MID + 6, 346, MW_W - 12, MW_H - 12};
+static const RECT MC_RESET   = {MW_W - 196, MW_H - 50, MW_W - 24, MW_H - 24};
+static const RECT* MIC_FADERS[5] = {&MC_AI_FADER, &MC_BG, &MC_IMP, &MC_GATE_TH, &MC_COMP_L};
+enum { MCH_NONE = -1, MCH_CLOSE = 100, MCH_AI_ON, MCH_BG_ON, MCH_IMP_ON, MCH_GATE_ON, MCH_GATE_AUTO, MCH_COMP_ON, MCH_RESET, MCH_MATCH };
+
+static std::atomic<int>& micKnob(int k) {
+    switch (k) {
+    case 0: return g.aiLevel;
+    case 1: return g.nrBg;
+    case 2: return g.nrImpact;
+    case 3: return g.micGateDb10;
+    default: return g.compLevel;
+    }
+}
+static int micKnobMin(int k) { return k == 3 ? -800 : 0; }
+static int micKnobMax(int k) { return k == 3 ? 0 : 100; }
+static int micKnobDefault(int k) {
+    switch (k) {
+    case 0: return MIC_DEFAULTS.aiLevel;
+    case 1: return MIC_DEFAULTS.bg;
+    case 2: return MIC_DEFAULTS.impact;
+    case 3: return MIC_DEFAULTS.gateDb10;
+    default: return MIC_DEFAULTS.compLevel;
+    }
+}
+static void micChanged(HWND h) {
+    g.isoVersion.fetch_add(1);
+    settingsSoon(h);
+    if (h) InvalidateRect(h, nullptr, FALSE);
+    if (hwndMain) InvalidateRect(hwndMain, nullptr, FALSE);
+}
+static void setMicKnob(HWND h, int k, int v) {
+    v = clampInt(v, micKnobMin(k), micKnobMax(k));
+    if (micKnob(k).load() == v) return;
+    micKnob(k) = v;
+    micChanged(h);
+}
+static void setMicFader(HWND h, int k, int x) {
+    setMicKnob(h, k, micKnobMin(k) + faderValue(*MIC_FADERS[k], x, micKnobMax(k) - micKnobMin(k)));
+}
+static void micReset(HWND h) {
+    for (int k = 0; k < 5; ++k) micKnob(k) = micKnobDefault(k);
+    g.aiOn = MIC_DEFAULTS.aiOn; g.nrBgOn = MIC_DEFAULTS.bgOn; g.nrImpactOn = MIC_DEFAULTS.impactOn;
+    g.micGateOn = MIC_DEFAULTS.gateOn; g.micGateAuto = MIC_DEFAULTS.gateAuto; g.compOn = MIC_DEFAULTS.compOn;
+    g.micMatch = MIC_DEFAULTS.matchOn;
+    micChanged(h);
+}
+// Noise reduction only works while the AI is off, as in Sonar.
+static bool micNrLive() { return !g.aiOn.load(); }
+static bool micFaderLive(int k) {
+    switch (k) {
+    case 0: return g.aiOn.load();
+    case 1: return micNrLive() && g.nrBgOn.load();
+    case 2: return micNrLive() && g.nrImpactOn.load();
+    case 3: return g.micGateOn.load() && !g.micGateAuto.load();
+    default: return g.compOn.load();
+    }
+}
+static int micFaderAt(POINT p) {
+    for (int k = 0; k < 5; ++k) {
+        RECT grab = *MIC_FADERS[k];
+        InflateRect(&grab, 8, 6);
+        if (PtInRect(&grab, p) && micFaderLive(k)) return k;
+    }
+    return MCH_NONE;
+}
+static int micHit(POINT p) {
+    if (PtInRect(&MC_CLOSE, p)) return MCH_CLOSE;
+    if (PtInRect(&MC_AI_ON, p)) return MCH_AI_ON;
+    if (PtInRect(&MC_MATCH, p)) return MCH_MATCH;
+    if (micNrLive() && PtInRect(&MC_BG_ON, p)) return MCH_BG_ON;
+    if (micNrLive() && PtInRect(&MC_IMP_ON, p)) return MCH_IMP_ON;
+    if (PtInRect(&MC_GATE_ON, p)) return MCH_GATE_ON;
+    if (g.micGateOn.load()) { const RECT a = {MC_GATE_AUTO.left, MC_GATE_AUTO.top - 4, MC_GATE_AUTO.right, MC_GATE_AUTO.bottom + 4}; if (PtInRect(&a, p)) return MCH_GATE_AUTO; }
+    if (PtInRect(&MC_COMP_ON, p)) return MCH_COMP_ON;
+    if (PtInRect(&MC_RESET, p)) return MCH_RESET;
+    return micFaderAt(p);
+}
+
+// A Sonar-style on/off switch: a pill with a knob, left off, right on.
+static void drawSwitch(HDC dc, int x, int y, bool on, bool live = true) {
+    Gdiplus::Graphics gr(dc);
+    gr.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    const COLORREF track = !live ? mixc(C_BACK, C_EDGE, 0.6) : (on ? C_GOLD : mixc(C_BACK, C_EDGE, 0.9));
+    roundBox(gr, x + 0.5f, y + 0.5f, 38.0f, 19.0f, 9.5f, track, 255, track);
+    Gdiplus::SolidBrush knob(gpColor(on && live ? RGB(255, 255, 255) : mixc(C_TEXT, C_BACK, 0.35)));
+    const float kx = on ? x + 21.5f : x + 3.5f;
+    gr.FillEllipse(&knob, kx, y + 3.5f, 13.0f, 13.0f);
+}
+static void micTitle(HDC dc, int x, int y, const wchar_t* s, bool live) {
+    label(dc, x, y, s, live ? C_TEXT : C_DIM, fntBold);
+}
+static void micValue(HDC dc, int k, bool live) {
+    const RECT& r = *MIC_FADERS[k];
+    wchar_t t[32];
+    const int v = micKnob(k).load();
+    if (k == 3) swprintf_s(t, L"%.1f dB", (g.micGateAuto.load() ? g.micGateDb.load() * 10.0f : (float)v) / 10.0f);
+    else if (k == 0) swprintf_s(t, L"%d%%", v);
+    else swprintf_s(t, L"%.2f", v / 100.0);
+    const RECT box = {r.right + 10, r.top - 1, r.right + 74, r.bottom + 1};
+    panel(dc, box, C_BACK, C_EDGE);
+    boxText(dc, box, t, live ? C_TEXT : C_DIM, fntUI, DT_CENTER);
+}
+static void paintMicWave(HDC dc, bool live) {
+    const RECT& r = MC_WAVE;
+    const int n = iso::MicChain::WAVE, at = g.micWaveAt.load();
+    const float mid = (r.top + r.bottom) / 2.0f, half = (r.bottom - r.top) / 2.0f - 2.0f;
+    std::vector<Gdiplus::PointF> pts;
+    for (int i = 0; i < n; ++i) {
+        const float pk = live ? g.micWave[(at + i) % n].load() : 0.0f;
+        // Louder shows taller, on a dB scale from -60 dBFS, alternating up and down like a waveform.
+        const float lv = pk > 1e-6f ? std::max(0.0f, std::min(1.0f, (20.0f * log10f(pk) + 60.0f) / 60.0f)) : 0.0f;
+        const float x = r.left + (r.right - r.left) * (i + 0.5f) / n;
+        pts.push_back(Gdiplus::PointF(x, mid + ((i & 1) ? lv : -lv) * half));
+    }
+    Gdiplus::Graphics gr(dc);
+    gr.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::Pen pen(gpColor(live ? RGB(52, 211, 178) : C_DIM), 2.0f);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    gr.DrawCurve(&pen, pts.data(), (INT)pts.size(), 0.5f);
+}
+static void paintMicLive(HDC dc) {
+    const RECT& r = MC_LIVE;
+    const bool on = aiModeOn() && g.running.load();
+    label(dc, r.left + 12, r.top + 12, L"LIVE", C_TEXT, fntBold);
+    auto bar = [&](int y, const wchar_t* name, float db) {
+        label(dc, r.left + 12, y, name, C_DIM, fntUI);
+        const RECT tr = {r.left + 90, y + 2, r.right - 90, y + 14};
+        panel(dc, tr, C_BACK, C_EDGE);
+        const float lv = on ? std::max(0.0f, std::min(1.0f, (db + 70.0f) / 70.0f)) : 0.0f;
+        if (lv > 0.0f) {
+            const RECT f = {tr.left + 1, tr.top + 1, tr.left + 1 + (int)((tr.right - tr.left - 2) * lv), tr.bottom - 1};
+            HBRUSH b = CreateSolidBrush(db > -6.0f ? RGB(236, 72, 84) : C_GOLD);
+            FillRect(dc, &f, b);
+            DeleteObject(b);
+        }
+        wchar_t t[24];
+        if (on && db > -100.0f) swprintf_s(t, L"%.0f dB", db); else wcscpy_s(t, L"-");
+        boxText(dc, RECT{r.right - 84, y, r.right - 12, y + 16}, t, C_TEXT, fntUI, DT_RIGHT);
+    };
+    bar(r.top + 40, L"Mic in", micShowIn);
+    bar(r.top + 64, L"Out", micShowOut);
+    wchar_t t[64];
+    if (!on) wcscpy_s(t, L"Turn on Noise isolation with AI to hear it work");
+    else if (g.aiOn.load()) swprintf_s(t, L"AI takes away %.0f dB right now", micShowCut);
+    else wcscpy_s(t, L"AI noise cancellation is off");
+    label(dc, r.left + 12, r.top + 90, t, C_DIM, fntUI);
+}
+
+static void paintMic(HDC dc, const RECT& rc) {
+    boxTitle(dc, rc, L"Noise Cancellation", MC_CLOSE, micHot == MCH_CLOSE);
+    const bool ai = g.aiOn.load(), nr = micNrLive(), gate = g.micGateOn.load(), comp = g.compOn.load();
+    // AI noise cancellation
+    panel(dc, MC_AI, C_PANEL, C_EDGE);
+    drawSwitch(dc, MC_AI_ON.left, MC_AI_ON.top, ai);
+    micTitle(dc, MC_AI_ON.left + 50, MC_AI_ON.top + 1, L"AI NOISE CANCELLATION", true);
+    drawSwitch(dc, MC_MATCH.left, MC_MATCH.top, g.micMatch.load());
+    micTitle(dc, MC_MATCH.left + 50, MC_MATCH.top + 1, L"SONAR MATCH", true);
+    paintMicWave(dc, ai && aiModeOn() && g.running.load());
+    label(dc, MC_AI_FADER.left - 40, MC_AI_FADER.top + 3, L"Min", C_DIM, fntUI);
+    drawFader(dc, MC_AI_FADER, g.aiLevel.load(), 100);
+    label(dc, MC_AI_FADER.right + 10, MC_AI_FADER.top + 3, L"Max", C_DIM, fntUI);
+    // Noise reduction
+    panel(dc, MC_NR, C_PANEL, C_EDGE);
+    micTitle(dc, 24, MC_NR.top + 12, L"NOISE REDUCTION", nr);
+    boxText(dc, RECT{24, MC_NR.top + 32, MC_NR.right - 12, MC_NR.top + 50},
+            ai ? L"Off while AI noise cancellation is on" : L"Steady noise (Background) and sudden noise (Impact)", C_DIM, fntUI, DT_LEFT);
+    drawSwitch(dc, MC_BG_ON.left, MC_BG_ON.top, g.nrBgOn.load(), nr);
+    label(dc, 72, MC_BG.top + 3, L"Background", nr ? C_TEXT : C_DIM, fntUI);
+    drawFader(dc, MC_BG, g.nrBg.load(), 100);
+    micValue(dc, 1, micFaderLive(1));
+    drawSwitch(dc, MC_IMP_ON.left, MC_IMP_ON.top, g.nrImpactOn.load(), nr);
+    label(dc, 72, MC_IMP.top + 3, L"Impact", nr ? C_TEXT : C_DIM, fntUI);
+    drawFader(dc, MC_IMP, g.nrImpact.load(), 100);
+    micValue(dc, 2, micFaderLive(2));
+    // Noise gate
+    panel(dc, MC_GATE, C_PANEL, C_EDGE);
+    drawSwitch(dc, MC_GATE_ON.left, MC_GATE_ON.top, gate);
+    micTitle(dc, MC_GATE_ON.left + 50, MC_GATE_ON.top + 1, L"NOISE GATE", true);
+    {
+        // The lamp: lit while the gate lets the mic through.
+        const bool open = gate && aiModeOn() && g.running.load() && g.micGateOpen.load();
+        Gdiplus::Graphics gr(dc);
+        gr.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::SolidBrush b(gpColor(open ? RGB(52, 211, 178) : mixc(C_BACK, C_EDGE, 0.8)));
+        gr.FillEllipse(&b, MC_GATE.right - 28.0f, MC_GATE_ON.top + 4.0f, 11.0f, 11.0f);
+    }
+    label(dc, MC_GATE_ON.left, MC_GATE_TH.top + 3, L"Threshold", gate ? C_TEXT : C_DIM, fntUI);
+    const int shownDb10 = g.micGateAuto.load() ? (int)lroundf(g.micGateDb.load() * 10.0f) : g.micGateDb10.load();
+    drawFader(dc, MC_GATE_TH, clampInt(shownDb10, -800, 0) + 800, 800);
+    micValue(dc, 3, gate);
+    drawCheck(dc, MC_GATE_AUTO.left, MC_GATE_AUTO.top, g.micGateAuto.load(), L"Set the threshold from the room by itself");
+    // Compressor
+    panel(dc, MC_COMP, C_PANEL, C_EDGE);
+    drawSwitch(dc, MC_COMP_ON.left, MC_COMP_ON.top, comp);
+    micTitle(dc, MC_COMP_ON.left + 50, MC_COMP_ON.top + 1, L"COMPRESSOR", true);
+    label(dc, 24, MC_COMP_L.top + 3, L"Level", comp ? C_TEXT : C_DIM, fntUI);
+    drawFader(dc, MC_COMP_L, g.compLevel.load(), 100);
+    micValue(dc, 4, comp);
+    if (comp && aiModeOn() && g.running.load()) {
+        wchar_t t[48];
+        swprintf_s(t, L"Evening out: %.1f dB", g.micCompGr.load());
+        label(dc, 24, MC_COMP_L.bottom + 14, t, C_DIM, fntUI);
+    }
+    // Live
+    panel(dc, MC_LIVE, C_PANEL, C_EDGE);
+    paintMicLive(dc);
+    iconButton(dc, MC_RESET, ICO_RESET, L"Back to default", micHot == MCH_RESET);
+    boxEdge(dc);
+}
+
+static LRESULT CALLBACK micProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        paintBox(h, paintMic);
+        return 0;
+    case WM_PRINTCLIENT:
+        printBox(h, (HDC)w, paintMic);
+        return 0;
+    case WM_TIMER: {
+        // Repaint all of it when something else changed the settings or switched the mode; the live parts always.
+        const int state = (g.isoVersion.load() & 0xFFFFFF) * 8 + (g.isolate.load() ? 4 : 0) + (g.running.load() ? 2 : 0) + (g.isoMode.load() == ISO_AI ? 1 : 0);
+        if (state != micState) { micState = state; InvalidateRect(h, nullptr, FALSE); }
+        micShowIn += (g.micIn.load() - micShowIn) * 0.5f;
+        micShowOut += (g.micOut.load() - micShowOut) * 0.5f;
+        micShowCut += (g.micAiCut.load() - micShowCut) * 0.3f;
+        invalidateDesign(h, MC_WAVE);
+        invalidateDesign(h, MC_LIVE);
+        invalidateDesign(h, RECT{MC_GATE.right - 30, MC_GATE_ON.top, MC_GATE.right - 12, MC_GATE_ON.bottom});
+        if (g.micGateAuto.load()) invalidateDesign(h, RECT{MC_GATE_TH.left - 8, MC_GATE_TH.top - 6, MC_GATE_TH.right + 80, MC_GATE_TH.bottom + 10});
+        if (g.compOn.load()) invalidateDesign(h, RECT{24, MC_COMP_L.bottom + 10, MC_COMP.right - 12, MC_COMP_L.bottom + 32});
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        boxTrackLeave(h, micMouse);
+        const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
+        if (micDrag >= 0) { setMicFader(h, micDrag, p.x); return 0; }
+        const int hit = micHit(p);
+        if (hit != micHot) { micHot = hit; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        micMouse = false;
+        if (micHot != MCH_NONE) { micHot = MCH_NONE; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    case WM_LBUTTONDBLCLK: {
+        const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
+        const int hit = micHit(p);
+        if (hit >= 0 && hit < 5) { setMicKnob(h, hit, micKnobDefault(hit)); return 0; }
+        return micProc(h, WM_LBUTTONDOWN, w, l);
+    }
+    case WM_LBUTTONDOWN: {
+        const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
+        for (int k = 0; k < 5; ++k) {
+            // The number after a fader: click it to type a value.
+            if (k == 0 || !micFaderLive(k)) continue;
+            const RECT& r = *MIC_FADERS[k];
+            const RECT num = {r.right + 10, r.top - 1, r.right + 74, r.bottom + 1};
+            if (!PtInRect(&num, p)) continue;
+            double typed = 0.0;
+            if (k == 3) {
+                if (askNumber(h, L"Threshold (dB)", micKnob(k).load() / 10.0, 1, -80.0, 0.0, typed)) setMicKnob(h, k, (int)lround(typed * 10.0));
+            } else if (askNumber(h, k == 4 ? L"Level" : (k == 1 ? L"Background" : L"Impact"), micKnob(k).load() / 100.0, 2, 0.0, 1.0, typed)) {
+                setMicKnob(h, k, (int)lround(typed * 100.0));
+            }
+            return 0;
+        }
+        const int hit = micHit(p);
+        switch (hit) {
+        case MCH_CLOSE: boxClose(h); return 0;
+        case MCH_AI_ON: g.aiOn = !g.aiOn.load(); micChanged(h); return 0;
+        case MCH_BG_ON: g.nrBgOn = !g.nrBgOn.load(); micChanged(h); return 0;
+        case MCH_IMP_ON: g.nrImpactOn = !g.nrImpactOn.load(); micChanged(h); return 0;
+        case MCH_GATE_ON: g.micGateOn = !g.micGateOn.load(); micChanged(h); return 0;
+        case MCH_GATE_AUTO: g.micGateAuto = !g.micGateAuto.load(); micChanged(h); return 0;
+        case MCH_COMP_ON: g.compOn = !g.compOn.load(); micChanged(h); return 0;
+        case MCH_MATCH: g.micMatch = !g.micMatch.load(); micChanged(h); return 0;
+        case MCH_RESET: micReset(h); return 0;
+        case MCH_NONE:
+            if (p.y < TITLE_H) { ReleaseCapture(); SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0); }
+            return 0;
+        default:
+            micDrag = hit;
+            SetCapture(h);
+            setMicFader(h, hit, p.x);
+            return 0;
+        }
+    }
+    case WM_LBUTTONUP:
+        if (micDrag != -1) { micDrag = -1; ReleaseCapture(); settingsFlush(); InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    case WM_CAPTURECHANGED:
+        if ((HWND)l != h && micDrag != -1) { micDrag = -1; settingsFlush(); InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    case WM_MOUSEWHEEL: {
+        POINT p = wheelPoint(h, l);
+        const int d = GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA;
+        if (d == 0) return 0;
+        if (const int k = micFaderAt(p); k >= 0) setMicKnob(h, k, micKnob(k).load() + d * (k == 3 ? 5 : 1));
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE) { boxClose(h); return 0; }
+        break;
+    case WM_DESTROY:
+        KillTimer(h, 1);
+        if (micDrag != -1) { micDrag = -1; ReleaseCapture(); }
+        hMicWin = nullptr;
+        micMouse = false;
+        micHot = MCH_NONE;
+        micState = -1;
+        if (hwndMain) InvalidateRect(hwndMain, nullptr, FALSE);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void openMicBox(HWND owner) {
+    if (hMicWin) {
+        ShowWindow(hMicWin, SW_SHOW);
+        SetForegroundWindow(hMicWin);
+        return;
+    }
+    micShowIn = micShowOut = -120.0f;
+    micShowCut = 0.0f;
+    RECT o;
+    GetWindowRect(owner, &o);
+    hMicWin = CreateWindowExW(WS_EX_TOOLWINDOW, L"PixlMic", L"Noise Cancellation", WS_POPUP | WS_CLIPCHILDREN,
+                              (o.left + o.right - sc(MW_W)) / 2, (o.top + o.bottom - sc(MW_H)) / 2, sc(MW_W), sc(MW_H),
+                              owner, nullptr, nullptr, nullptr);
+    if (!hMicWin) return;
+    SetTimer(hMicWin, 1, 50, nullptr);
+    boxShow(hMicWin);
+    SetForegroundWindow(hMicWin);
+}
+
 static int aboutResult = 0, aboutHot = 0;
 static bool aboutMouse = false;
 static RECT aboutLink = {0, 0, 0, 0};
@@ -7906,7 +8413,7 @@ static void paintAbout(HDC dc, const RECT& rc) {
     }
     label(dc, 24, 58, L"Programmed by :", C_GOLD, fntBold);
     {
-        const wchar_t* name = L"9i55";
+        const wchar_t* name = L"9i505";
         const COLORREF ink = aboutHot == 2 ? C_GOLD : C_TEXT;
         label(dc, 24, 82, name, ink, fntBold);
         SIZE sz{};
@@ -10224,12 +10731,12 @@ static void mixVFader(HDC dc, const RECT& r, int value) {
     gr.DrawLine(&grip, cx - 6.0f, ky + 0.5f, cx + 6.0f, ky + 0.5f);
 }
 
-// Same -60..0 dB scale as the fader, so the bar never climbs above the knob.
+// On the fader's own scale, so the bar never climbs above the knob.
 static void mixMeter(HDC dc, const RECT& r, float peak) {
     panel(dc, r, C_BACK, C_EDGE);
     if (peak <= 0.0f) return;
     const float db = 20.0f * log10f(peak);
-    const float lv = std::max(0.0f, std::min(1.0f, (db - mixer::MIN_DB10 / 10.0f) / (-mixer::MIN_DB10 / 10.0f)));
+    const float lv = mixer::faderPos((int)lroundf(std::max(-1000.0f, db) * 10.0f)) / 1000.0f;
     const int h = (int)((r.bottom - r.top - 2) * lv);
     if (h <= 0) return;
     const COLORREF c = db > -3.0f ? RGB(220, 70, 70) : db > -12.0f ? RGB(230, 190, 60) : RGB(90, 200, 120);
@@ -10270,14 +10777,29 @@ static void paintMixer(HDC dc, const RECT& rc) {
             drawIcon(dc, (x.left + x.right) / 2.0f, (x.top + x.bottom) / 2.0f, ICO_CLOSE, hx ? RGB(220, 70, 70) : C_DIM, C_BACK);
         }
         iconButton(dc, mixAddRect(i), ICO_NONE, L"+  Add program", mixHot == base + MS_ADD, (int)s.apps.size() < mixer::MAX_APPS);
-        mixVFader(dc, mixFaderRect(i), (s.db10 - mixer::MIN_DB10) * 1000 / -mixer::MIN_DB10);
+        mixVFader(dc, mixFaderRect(i), mixer::faderPos(s.db10));
+        {
+            // 0 dB: the program as loud as it plays by itself. Above it Pixl plays it louder.
+            const RECT fr = mixFaderRect(i);
+            const int y0 = fr.bottom - 6 - (int)lround((fr.bottom - fr.top - 12) * mixer::faderPos(0) / 1000.0);
+            const RECT tick = {fr.left - 8, y0, fr.left - 1, y0 + 1};
+            HBRUSH tb = CreateSolidBrush(C_DIM);
+            FillRect(dc, &tick, tb);
+            DeleteObject(tb);
+        }
         // The level is captured after the fader, so it already follows it.
         const bool quiet = s.mute || (anySolo && !s.solo) || (!s.audio && !s.b1);
         mixMeter(dc, mixMeterRect(i), quiet ? 0.0f : gMix.level[i].load());
         wchar_t db[24];
         if (s.db10 <= mixer::MIN_DB10) wcscpy_s(db, L"-inf dB");
-        else swprintf_s(db, L"%.1f dB", s.db10 / 10.0);
+        else swprintf_s(db, s.db10 > 0 ? L"+%.1f dB" : L"%.1f dB", s.db10 / 10.0);
         mixText(dc, RECT{mixX(i) + 6, MIX_TOP + 462, mixX(i) + 72, MIX_TOP + 482}, db, C_TEXT, fntUI, DT_CENTER);
+        // The level as a share of how loud the program plays by itself: 100% at 0 dB, up to 398% at +12 dB.
+        mixText(dc, RECT{mixX(i) + 76, MIX_TOP + 352, mixX(i) + MIX_SW - 10, MIX_TOP + 370}, L"Level", C_DIM, fntUI);
+        wchar_t pc[24];
+        swprintf_s(pc, L"%.0f%%", 100.0f * mixer::volumeOf(s.db10));
+        mixText(dc, RECT{mixX(i) + 76, MIX_TOP + 370, mixX(i) + MIX_SW - 10, MIX_TOP + 392}, pc, C_TEXT, fntBold);
+        mixText(dc, RECT{mixX(i) + 76, MIX_TOP + 420, mixX(i) + MIX_SW - 10, MIX_TOP + 456}, L"Shift: fine", C_DIM, fntUI);
         iconButton(dc, mixButton(i, MS_AUDIO), ICO_SPEAKER, L"Audio", mixHot == base + MS_AUDIO, true, s.audio);
         iconButton(dc, mixButton(i, MS_B1), ICO_MIC, L"Mic", mixHot == base + MS_B1, true, s.b1);
         iconButton(dc, mixButton(i, MS_SOLO), ICO_PERSON, L"Solo", mixHot == base + MS_SOLO, true, s.solo);
@@ -10306,18 +10828,32 @@ static int mixHit(POINT p) {
 
 static void mixSave() { gMix.save(MIX_KEY); gMix.poke(); }
 
-static void mixSetGain(HWND h, int i, int y) {
+// Dragging: the knob follows the mouse on the fader's law. With Shift held it moves a fifth as far as the mouse, from
+// where it was when Shift went down, so it never jumps.
+static int mixDragY = 0, mixDragPos = 0;
+static bool mixDragFine = false;
+
+static void mixSetGain(HWND h, int i, int y, bool start = false) {
     const RECT r = mixFaderRect(i);
     const int top = r.top + 6, bot = r.bottom - 6;
-    // Even in dB from the bottom (-60) to the top (0), so the quiet half has room too.
-    const float frac = std::max(0.0f, std::min(1.0f, (bot - y) / (float)(bot - top)));
-    int v = (int)lroundf(mixer::MIN_DB10 * (1.0f - frac));
-    if (v > -5) v = 0;
+    const bool fine = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    int pos;
+    if (start || fine != mixDragFine) {
+        int db10;
+        { std::lock_guard<std::mutex> lk(gMix.mx); db10 = gMix.strips[i].db10; }
+        mixDragFine = fine;
+        mixDragY = y;
+        mixDragPos = start && !fine ? (int)lroundf(1000.0f * (bot - y) / (bot - top)) : mixer::faderPos(db10);
+    }
+    if (fine) pos = mixDragPos + (int)lroundf(200.0f * (mixDragY - y) / (bot - top));
+    else pos = (int)lroundf(1000.0f * (bot - y) / (bot - top));
+    const int v = mixer::faderDb10(std::max(0, std::min(1000, pos)));
     {
         std::lock_guard<std::mutex> lk(gMix.mx);
+        if (gMix.strips[i].db10 == v) return;
         gMix.strips[i].db10 = v;
     }
-    gMix.poke();
+    gMix.volumeNow();
     InvalidateRect(h, nullptr, FALSE);
 }
 
@@ -11037,10 +11573,10 @@ static LRESULT CALLBACK mixerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             { std::lock_guard<std::mutex> lk(gMix.mx); db10 = gMix.strips[i].db10; }
             double typed = 0.0;
             const std::wstring title = L"Audio " + std::to_wstring(i + 1) + L" volume (dB)";
-            if (askNumber(h, title, db10 / 10.0, 1, mixer::MIN_DB10 / 10.0, 0.0, typed)) {
+            if (askNumber(h, title, db10 / 10.0, 1, mixer::MIN_DB10 / 10.0, mixer::MAX_DB10 / 10.0, typed)) {
                 {
                     std::lock_guard<std::mutex> lk(gMix.mx);
-                    gMix.strips[i].db10 = std::max(mixer::MIN_DB10, std::min(0, (int)lround(typed * 10.0)));
+                    gMix.strips[i].db10 = std::max(mixer::MIN_DB10, std::min(mixer::MAX_DB10, (int)lround(typed * 10.0)));
                 }
                 mixSave();
                 InvalidateRect(h, nullptr, FALSE);
@@ -11061,7 +11597,7 @@ static LRESULT CALLBACK mixerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (hit >= MH_STRIP && (hit - MH_STRIP) % MH_SPAN == MS_FADER) {
             mixDrag = (hit - MH_STRIP) / MH_SPAN;
             SetCapture(h);
-            mixSetGain(h, mixDrag, p.y);
+            mixSetGain(h, mixDrag, p.y, true);
             return 0;
         }
         if (hit == MH_NONE) {
@@ -11091,12 +11627,13 @@ static LRESULT CALLBACK mixerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (!PtInRect(&r, p)) continue;
             {
                 std::lock_guard<std::mutex> lk(gMix.mx);
-                // One wheel notch is 1 dB; hold Shift for 0.1 dB.
+                // One wheel notch is 0.5 dB; hold Shift for 0.1 dB.
                 int& g0 = gMix.strips[i].db10;
-                const int stepDb10 = (GetKeyState(VK_SHIFT) & 0x8000) ? 1 : 10;
-                g0 = std::max(mixer::MIN_DB10, std::min(0, g0 + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? stepDb10 : -stepDb10)));
+                const int stepDb10 = (GetKeyState(VK_SHIFT) & 0x8000) ? 1 : 5;
+                g0 = std::max(mixer::MIN_DB10, std::min(mixer::MAX_DB10, g0 + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? stepDb10 : -stepDb10)));
             }
-            mixSave();
+            gMix.save(MIX_KEY);
+            gMix.volumeNow();
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
@@ -12635,6 +13172,9 @@ static void drawDevices(HDC dc) {
         wchar_t lv[16];
         swprintf_s(lv, 16, L"%d", isoFader().load());
         label(dc, R_ISOLVL.right + 8, TITLE_H + 80, lv, on ? C_TEXT : C_DIM, fntBold);
+        const int m = g.isoMode.load();
+        iconButton(dc, R_ISO_SET, ICO_GEAR, nullptr, isHot(R_ISO_SET), m == ISO_AI || m == ISO_VOCAL,
+                   m == ISO_AI ? hMicWin != nullptr : (m == ISO_VOCAL && hTone != nullptr));
     }
     drawCheck(dc, R_STARTUP.left, R_STARTUP.top, startupOn, ICO_POWER, L"Start with Windows");
 }
@@ -12992,7 +13532,10 @@ static int knobDefault(int k) {
     switch (k) {
     case K_AMOUNT: return AMOUNT_DEFAULT;
     case K_MIC: return MIC_DEFAULT;
-    case K_ISO: return g.isoMode.load() == ISO_VOCAL ? VOCAL_DEFAULT_LEVEL : ISO_DEFAULT;
+    case K_ISO: {
+        const int m = g.isoMode.load();
+        return m == ISO_VOCAL ? VOCAL_DEFAULT_LEVEL : (m == ISO_AI ? MIC_DEFAULTS.aiLevel : ISO_DEFAULT);
+    }
     case K_CLIP_VOL: return CLIP_GAIN_DEFAULT;
     case K_CLIP_SPEED: return 100;
     case K_APP: return APP_GAIN_DEFAULT;
@@ -13196,9 +13739,10 @@ static const Hint HINTS[] = {
     {&R_SETUP_DEL, HINT_MAIN, L"Delete the setup in use."},
     {&R_DEV_REFRESH, HINT_MAIN, L"Look again for microphones and speakers you just plugged in."},
     {&R_ISOLATE, HINT_MAIN, L"Cut room noise, keyboard clicks and other voices out of your mic."},
-    {&R_ISO_PREV, HINT_MAIN, L"Isolation mode. Vocal is the voice gate with its Lo, Mid and Hi lift; Gate only shuts the mic between words; Clean, Studio and Broadcast also clean the sound."},
-    {&R_ISO_NEXT, HINT_MAIN, L"Isolation mode. Vocal is the voice gate with its Lo, Mid and Hi lift; Gate only shuts the mic between words; Clean, Studio and Broadcast also clean the sound."},
-    {&R_ISOLVL, HINT_MAIN, L"How hard the isolation works. Higher cuts more noise and may clip quiet words. With Vocal, 50 is its normal strength and 100 cuts twice as deep; its Lo, Mid, Hi and Out are in the Tone window."},
+    {&R_ISO_PREV, HINT_MAIN, L"Isolation mode. AI is noise cancellation by a neural network (RNNoise), with noise reduction, a noise gate and a compressor in its window; Vocal is the voice gate with its Lo, Mid and Hi lift; Gate only shuts the mic between words; Clean, Studio and Broadcast also clean the sound."},
+    {&R_ISO_NEXT, HINT_MAIN, L"Isolation mode. AI is noise cancellation by a neural network (RNNoise), with noise reduction, a noise gate and a compressor in its window; Vocal is the voice gate with its Lo, Mid and Hi lift; Gate only shuts the mic between words; Clean, Studio and Broadcast also clean the sound."},
+    {&R_ISOLVL, HINT_MAIN, L"How hard the isolation works. With AI it is the AI noise cancellation, from Min to Max. In the other modes higher cuts more noise and may clip quiet words; with Vocal, 50 is its normal strength and 100 cuts twice as deep."},
+    {&R_ISO_SET, HINT_MAIN, L"Settings of the isolation mode: for AI the Noise Cancellation window (AI noise cancellation, noise reduction, noise gate, compressor), or for Vocal the Tone window."},
     {&R_STARTUP, HINT_MAIN, L"Open Pixl when Windows starts."},
     {&R_SLIDER, HINT_MAIN, L"How much echo. 0 turns it off; above 50 the echo starts to cover the voice."},
     {&R_EIGHT[0], HINT_MAIN, L""},
@@ -13489,7 +14033,7 @@ static void applyScale(HWND h, float s, const POINT* at, bool live) {
     RECT wr;
     GetWindowRect(h, &wr);
     SetWindowPos(h, nullptr, at ? at->x : wr.left, at ? at->y : wr.top, sc(WIN_W), sc(WIN_H), SWP_NOZORDER | SWP_NOACTIVATE);
-    const struct { HWND box; int w, h; } open[3] = {{hTone, TONE_W, TONE_H}, {hBoard, BOARD_W, BOARD_H}, {hMixer, MIX_W, MIX_H}};
+    const struct { HWND box; int w, h; } open[4] = {{hTone, TONE_W, TONE_H}, {hMicWin, MW_W, MW_H}, {hBoard, BOARD_W, BOARD_H}, {hMixer, MIX_W, MIX_H}};
     for (const auto& o : open) {
         if (!o.box) continue;
         RECT br;
@@ -13510,7 +14054,7 @@ static void setUiType(const std::wstring& face, bool bold, int size) {
     makeFonts();
     placeChildren();
     tipsPlace();
-    for (HWND w : {hwndMain, hTone, hBoard, hLook, trim.wnd})
+    for (HWND w : {hwndMain, hTone, hMicWin, hBoard, hLook, trim.wnd})
         if (w) RedrawWindow(w, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
 
@@ -13827,7 +14371,7 @@ static std::vector<const RECT*> hoverables() {
         if (updState.load() == 1 && !layoutEditing) v.push_back(&R_UPDATE);
         v.push_back(&R_LAYOUT);
         if (layoutEditing) v.push_back(&R_LAYOUT_RESET);
-        v.insert(v.end(), {&R_BOARD, &R_MIXER, &R_TONE, &R_SETUP_PREV, &R_SETUP_NEXT, &R_SAVE, &R_SETUP_DEL, &R_DEV_REFRESH, &R_ISO_PREV, &R_ISO_NEXT,
+        v.insert(v.end(), {&R_BOARD, &R_MIXER, &R_TONE, &R_SETUP_PREV, &R_SETUP_NEXT, &R_SAVE, &R_SETUP_DEL, &R_DEV_REFRESH, &R_ISO_PREV, &R_ISO_NEXT, &R_ISO_SET,
                            &R_EQ_SAVE, &R_EQ_DROP, &R_EQ_DEF, &R_CLIP_FILE, &R_CLIP_PLAY, &R_CLIP_STOP,
                            &R_CLIP_BACK, &R_CLIP_FWD, &R_MASK_OFF, &R_GLITCH, &R_GLITCH_KEY, &R_SB_UP, &R_SB_DOWN, &R_SB_TRACK});
         v.insert(v.end(), {&R_PLUG_TAB_VOICE, &R_PLUG_TAB_PROG});
@@ -14559,7 +15103,7 @@ static std::vector<ValueSpot> valueSpots() {
     std::vector<ValueSpot> v = {
         {K_AMOUNT, RECT{448, TITLE_H + 151, 556, TITLE_H + 171}, L"Effects amount", 0, 100, 0},
         {K_MIC, RECT{448, 261, 560, 281}, L"Microphone level", 0, MIC_MAX, 0},
-        {K_ISO, after(R_ISOLVL, 8, TITLE_H + 80, 44), L"Noise isolation", 0, 100, 0},
+        {K_ISO, after(R_ISOLVL, 8, TITLE_H + 80, 30), L"Noise isolation", 0, 100, 0},
         {K_PITCH, after(R_PITCH, 8, VOICE_Y + 37, 70), L"Pitch (Hz)", -PITCH_SPAN, PITCH_SPAN, 0},
         {K_SIZE, after(R_SIZE, 8, VOICE_Y + 37, 56), L"Size (%)", VSIZE_MIN, VSIZE_MAX, 0},
         {K_VOICE, after(R_VOICE, 8, VOICE_Y + 70, 100), L"Voice changer", -100, 100, 0},
@@ -15171,6 +15715,16 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             hotLeave(h);
             openToneBox(h);
             InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        if (PtInRect(&R_ISO_SET, p)) {
+            const int m = g.isoMode.load();
+            if (m == ISO_AI || m == ISO_VOCAL) {
+                hotLeave(h);
+                if (m == ISO_AI) openMicBox(h);
+                else openToneBox(h);
+                InvalidateRect(h, nullptr, FALSE);
+            }
             return 0;
         }
         {
@@ -15916,6 +16470,43 @@ static void carryOldSettings() {
     }
 }
 
+#ifdef PIXL_PREVIEW
+// Preview: PIXL_MIC names a raw 48 kHz mono float file that runs through the mic chain in a loop, in time and without
+// sound, so its window shows real measurements.
+static void previewMic() {
+    wchar_t path[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"PIXL_MIC", path, MAX_PATH)) return;
+    std::vector<float> s;
+    if (FILE* f = _wfopen(path, L"rb")) {
+        float b[4096];
+        size_t n;
+        while ((n = fread(b, sizeof(float), 4096, f)) > 0) s.insert(s.end(), b, b + n);
+        fclose(f);
+    }
+    const size_t BLOCK = FS / 100;
+    if (s.size() < 2 * BLOCK) return;
+    g.isolate = true;
+    g.isoMode = ISO_AI;
+    g.running = true;
+    std::thread([s, BLOCK]() {
+        const auto c = std::make_unique<iso::MicChain>();
+        c->prepare(FS);
+        std::vector<float> blk(BLOCK);
+        int seen = -1;
+        for (size_t at = 0; !g.quit.load(); at = at + 2 * BLOCK > s.size() ? 0 : at + BLOCK) {
+            if (seen != g.isoVersion.load()) {
+                seen = g.isoVersion.load();
+                c->configure(micSettings());
+            }
+            std::copy(s.begin() + at, s.begin() + at + BLOCK, blk.begin());
+            c->process(blk.data(), (int)BLOCK);
+            micPublish(*c);
+            Sleep(10);
+        }
+    }).detach();
+}
+#endif
+
 int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int nShow) {
     bool updated = false;  // started by the old version right after it swapped itself out
     {
@@ -16044,6 +16635,8 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
         ab.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&ab);
         WNDCLASSW tn{}; tn.style = CS_DBLCLKS; tn.lpfnWndProc = scaledProc<toneProc>; tn.hInstance = hi; tn.lpszClassName = L"PixlTone";
         tn.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&tn);
+        WNDCLASSW ca{}; ca.style = CS_DBLCLKS; ca.lpfnWndProc = scaledProc<micProc>; ca.hInstance = hi; ca.lpszClassName = L"PixlMic";
+        ca.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&ca);
         WNDCLASSW bd{}; bd.style = CS_DBLCLKS; bd.lpfnWndProc = scaledProc<boardProc>; bd.hInstance = hi; bd.lpszClassName = L"PixlBoard";
         bd.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&bd);
         WNDCLASSW mx{}; mx.style = CS_DBLCLKS; mx.lpfnWndProc = scaledProc<mixerProc>; mx.hInstance = hi; mx.lpszClassName = L"PixlMixer";
@@ -16188,8 +16781,17 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
 
 #ifndef PIXL_PREVIEW
     std::thread th(audioThread);
+#else
+    previewMic();
 #endif
     windowOpen(hwnd, nShow);
+#ifdef PIXL_PREVIEW
+    // PIXL_OPEN=mic opens the Noise Cancellation window.
+    {
+        wchar_t open[32];
+        if (GetEnvironmentVariableW(L"PIXL_OPEN", open, 32) && _wcsicmp(open, L"mic") == 0) openMicBox(hwnd);
+    }
+#endif
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {

@@ -8,7 +8,7 @@ Pixl.exe  = updates installed with the Update button inside Pixl
 These count downloads, not unique people. Needs the GitHub CLI (gh).
 #>
 $ErrorActionPreference = 'Stop'
-$repo = '9i55/Pixl'
+$repo = '9i505/Pixl'
 $releases = gh api "repos/$repo/releases" | ConvertFrom-Json
 $rows = foreach ($r in $releases) {
     $count = { param($name) ($r.assets | Where-Object name -eq $name | Measure-Object download_count -Sum).Sum }

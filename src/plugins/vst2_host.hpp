@@ -305,7 +305,7 @@ private:
         case hostGetTime: return self ? (intptr_t)&self->time_ : 0;
         case hostGetCurrentProcessLevel: return 0;
         case hostGetAutomationState: return 1;  // off
-        case hostGetVendorString: if (ptr) strcpy_s((char*)ptr, 64, "9i55"); return 1;
+        case hostGetVendorString: if (ptr) strcpy_s((char*)ptr, 64, "9i505"); return 1;
         case hostGetProductString: if (ptr) strcpy_s((char*)ptr, 64, "Pixl"); return 1;
         case hostGetVendorVersion: return 1000;
         case hostGetLanguage: return 1;  // English
