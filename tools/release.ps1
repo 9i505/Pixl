@@ -41,6 +41,10 @@ Set-Content src\version.hpp $v -NoNewline -Encoding ascii
 # 2. Build
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+if (-not $msbuild) {  # vswhere can miss the Build Tools on their own
+    $msbuild = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\*\MSBuild\Current\Bin\MSBuild.exe", "$env:ProgramFiles\Microsoft Visual Studio\2022\*\MSBuild\Current\Bin\MSBuild.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $msbuild) { throw "MSBuild not found" }
 & $msbuild Pixl.sln /p:Configuration=Release /p:Platform=x64 /m /nologo /v:minimal
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 $exe = Join-Path $root 'build\MasonEAX\Pixl.exe'

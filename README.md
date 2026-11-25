@@ -35,7 +35,7 @@
 - **الساوندبورد:** 12 Pad، ولكل واحد مفتاح يشغّله حتى وأنت داخل لعبة. اسحب الأصوات وأفلتها على الـ Pads، أو اسحب ملفات من سطح المكتب مباشرة.
 - **المسجّل:** يحتفظ بآخر دقائق من صوتك.
 - **8D Audio:** بيئة (Environment) تخلي صوتك والكليبات والبرنامج يدورون حول راسك، مع Bass و Clarity وصدى قاعة خاص فيه (Echo)، وتتحكم بالحركة: Move و Speed و Width.
-- **الإضافات (Plugins):** فيه 20 تأثير مدمج في Pixl (Reverb, Delay, Chorus, Phaser, Compressor, Filter, Stereo...) تشتغل عند الكل بدون تحميل، وتقدر بعد تحط إضافات VST2 (مثل إضافات Kilohearts kHs) على صوتك أو على برنامج تختاره، من لوحة Plugins. كليك على الإضافة يفتح نافذتها، وكليك يمين يعطيك خياراتها (إيقاف، ترتيب، حذف). Pixl يدوّر عليها في مجلدات VST المعروفة ومجلد تختاره، وإعداداتها تنحفظ.
+- **الإضافات (Plugins):** فيه 24 تأثير مدمج في Pixl (Reverb, Delay, Chorus, Phaser, Compressor, Filter, Stereo...)، منها أربعة للأغاني: Music Enhancer يوضّح الصوت ويريّحه، 8-Band EQ، Crossfeed للسماعات، وVolume Leveller يخلي كل الأغاني بنفس العلو، تشتغل عند الكل بدون تحميل، وتقدر بعد تحط إضافات VST2 (مثل إضافات Kilohearts kHs) على صوتك أو على برنامج تختاره، من لوحة Plugins. كليك على الإضافة يفتح نافذتها، وكليك يمين يعطيك خياراتها (إيقاف، ترتيب، حذف). Pixl يدوّر عليها في مجلدات VST المعروفة ومجلد تختاره، وإعداداتها تنحفظ.
 
 ### التحميل والتثبيت
 
@@ -107,7 +107,7 @@
 - **Soundboard:** 12 pads, each with a key that plays it even inside a game. Drag sounds onto pads, or drop sound files straight from Explorer.
 - **Recorder:** keeps the last few minutes of your voice.
 - **8D Audio:** an Environment that carries your voice, sound clips and the program round your head, with Bass, Clarity and its own hall (Echo), and Move, Speed and Width for the motion.
-- **Plugins:** 20 effects built into Pixl (Reverb, Delay, Chorus, Phaser, Compressor, Filter, Stereo...) that work on every PC with nothing to install, and VST2 effects (Kilohearts' kHs ones, for example) too, on your voice or on a program you pick, from the Plugins panel. Click an effect to open its window; right-click it to turn it off, move it or remove it. Pixl finds them in the usual VST folders and a folder you choose, and keeps their settings. VST is a trademark of Steinberg Media Technologies GmbH.
+- **Plugins:** 24 effects built into Pixl (Reverb, Delay, Chorus, Phaser, Compressor, Filter, Stereo...), four of them for music (Music Enhancer for a clearer sound that is easier on the ear, 8-Band EQ, Crossfeed for headphones, Volume Leveller for every song at the same loudness), that work on every PC with nothing to install, and VST2 effects (Kilohearts' kHs ones, for example) too, on your voice or on a program you pick, from the Plugins panel. Click an effect to open its window; right-click it to turn it off, move it or remove it. Pixl finds them in the usual VST folders and a folder you choose, and keeps their settings. VST is a trademark of Steinberg Media Technologies GmbH.
 
 ### Download and install
 

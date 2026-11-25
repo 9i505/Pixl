@@ -661,6 +661,197 @@ protected:
     }
 };
 
+// ---------------------------------------------------------------- for music
+
+// A ceiling the sound never passes: the gain is already down when a peak arrives (1.5 ms ahead) and comes back
+// slowly, so a boost before it cannot clip. Below the ceiling it changes nothing but those 1.5 ms.
+struct Ceiling {
+    static const int LOOK = 72;
+    Line dl, dr;
+    float peaks[LOOK] = {};
+    int pp = 0;
+    float g = 1.0f, rel = settle(150.0);
+    Ceiling() { dl.init(0.01); dr.init(0.01); }
+    void run(float& l, float& r, float ceil) {
+        dl.push(l); dr.push(r);
+        peaks[pp] = std::max(std::fabs(l), std::fabs(r));
+        pp = (pp + 1) % LOOK;
+        float most = 0.0f;
+        for (float v : peaks) most = std::max(most, v);
+        const float want = most > ceil ? ceil / most : 1.0f;
+        g = want < g ? g + (want - g) * (4.0f / LOOK) : want + rel * (g - want);
+        l = std::clamp(dl.at(LOOK - 1) * g, -ceil, ceil);
+        r = std::clamp(dr.at(LOOK - 1) * g, -ceil, ceil);
+    }
+};
+
+static const wchar_t* const SPEEDS[] = {L"Slow", L"Normal", L"Fast"};
+
+// Music made clearer and easier on the ear with five knobs: Bass (a shelf under 90 Hz), Clean (takes out the boxy
+// 300 Hz that clouds a mix), Vocals (2.8 kHz, where voices are understood), Air (a shelf over 11 kHz) and Smooth,
+// which turns the 3-7 kHz band down only while it sticks out (harsh cymbals, shouted vocals, bright masters): the
+// part that tires the ear. A ceiling at the end keeps the boosts from clipping.
+class Enhancer : public Effect {
+public:
+    Enhancer() : Effect(L"enhancer", L"Music Enhancer", {{L"Bass", -6, 9, 2, L"dB"}, {L"Clean", 0, 100, 40, L"%"}, {L"Vocals", -6, 6, 1, L"dB"},
+                                                          {L"Air", -6, 9, 2, L"dB"}, {L"Smooth", 0, 100, 50, L"%"}, {L"Output", -12, 6, 0, L"dB"}}) {}
+protected:
+    static constexpr double HARSH_HZ = 4500.0, HARSH_Q = 0.9;
+    static constexpr float MAX_CUT_DB = 6.0f;  // Smooth at 100%, the band at its loudest
+    BQ eq_[2][4], band_[2];
+    Ceiling top_;
+    float out_ = 1, outW_ = 1, eb_ = 0, ef_ = 0, k_ = 0;
+    float envA_ = settle(30.0), kAtt_ = settle(10.0), kRel_ = settle(150.0);
+    void update() override {
+        outW_ = dbGain(p(5));
+        for (int c = 0; c < 2; ++c) {
+            design(eq_[c][0], BQ_LSHELF, 90.0, 0.707, p(0));
+            design(eq_[c][1], BQ_PEAK, 300.0, 0.9, -4.0 * p(1) / 100.0);
+            design(eq_[c][2], BQ_PEAK, 2800.0, 0.8, p(2));
+            design(eq_[c][3], BQ_HSHELF, 11000.0, 0.707, p(3));
+            design(band_[c], BQ_BP, HARSH_HZ, HARSH_Q);
+        }
+    }
+    void run(float* l, float* r, int n) override {
+        const float smooth = p(4) / 100.0f;
+        for (int i = 0; i < n; ++i) {
+            float a = l[i], b = r[i];
+            for (int s = 0; s < 4; ++s) { a = eq_[0][s].run(a); b = eq_[1][s].run(b); }
+            // The harsh band against the whole sound: at its usual share (14 dB under) nothing happens; 8 dB more
+            // and it is turned down all the way. Taking k of the band out of the sound is a dip of 1 - k there.
+            const float ha = band_[0].run(a), hb = band_[1].run(b);
+            eb_ = (ha * ha + hb * hb) + envA_ * (eb_ - (ha * ha + hb * hb));
+            ef_ = (a * a + b * b) + envA_ * (ef_ - (a * a + b * b));
+            float want = 0.0f;
+            if (smooth > 0.0f && ef_ > 1e-9f) {
+                const float share = 10.0f * std::log10(eb_ / ef_ + 1e-12f);
+                const float depth = MAX_CUT_DB * smooth * std::clamp((share + 14.0f) / 8.0f, 0.0f, 1.0f);
+                want = 1.0f - dbGain(-depth);
+            }
+            k_ = want > k_ ? want + kAtt_ * (k_ - want) : want + kRel_ * (k_ - want);
+            out_ += 0.002f * (outW_ - out_);
+            a = (a - k_ * ha) * out_;
+            b = (b - k_ * hb) * out_;
+            top_.run(a, b, 0.966f);  // -0.3 dB
+            l[i] = a; r[i] = b;
+        }
+    }
+};
+
+class Eq8 : public Effect {
+public:
+    Eq8() : Effect(L"eq8", L"8-Band EQ", {{L"60 Hz", -12, 12, 0, L"dB"}, {L"150 Hz", -12, 12, 0, L"dB"}, {L"400 Hz", -12, 12, 0, L"dB"},
+                                         {L"1 kHz", -12, 12, 0, L"dB"}, {L"2.5 kHz", -12, 12, 0, L"dB"}, {L"6 kHz", -12, 12, 0, L"dB"},
+                                         {L"10 kHz", -12, 12, 0, L"dB"}, {L"16 kHz", -12, 12, 0, L"dB"}}) {}
+protected:
+    BQ q_[2][8];
+    Ceiling top_;
+    void update() override {
+        static const double HZ[8] = {60, 150, 400, 1000, 2500, 6000, 10000, 16000};
+        for (int c = 0; c < 2; ++c)
+            for (int b = 0; b < 8; ++b)
+                design(q_[c][b], b == 0 ? BQ_LSHELF : b == 7 ? BQ_HSHELF : BQ_PEAK, HZ[b], b == 0 || b == 7 ? 0.707 : 1.1, p(b));
+    }
+    void run(float* l, float* r, int n) override {
+        for (int i = 0; i < n; ++i) {
+            float a = l[i], b = r[i];
+            for (int s = 0; s < 8; ++s) { a = q_[0][s].run(a); b = q_[1][s].run(b); }
+            top_.run(a, b, 0.966f);
+            l[i] = a; r[i] = b;
+        }
+    }
+};
+
+// Headphones the way speakers sound: each ear also gets the other side's sound, lower and without its top, as the
+// head lets it through in a room (Bauer's stereophonic-to-binaural filter, the "bs2b" everyone uses). Hard-panned
+// instruments stop pulling at one ear, which is what tires in long listening. Not for speakers.
+class Crossfeed : public Effect {
+public:
+    Crossfeed() : Effect(L"crossfeed", L"Crossfeed", {{L"Amount", 0, 100, 70, L"%"}, {L"Cutoff", 300, 2000, 700, L"Hz", LOG}}) {}
+protected:
+    float a0lo_ = 0, b1lo_ = 0, a0hi_ = 1, a1hi_ = 0, b1hi_ = 0, gain_ = 1;
+    float lo_[2] = {}, hi_[2] = {}, x1_[2] = {};
+    bool off_ = false;
+    void update() override {
+        off_ = p(0) < 1.0f;
+        // The other side arrives 13 dB down at 1%, 3 dB down at 100% (bs2b's own default is 6.75 dB down: 62%).
+        const double gbLo = -13.0 + 10.0 * p(0) / 100.0, feed = (gbLo + 3.0) * (-6.0 / 5.0), gbHi = feed / 6.0 - 3.0;
+        const double gLo = std::pow(10.0, gbLo / 20.0), gHi = 1.0 - std::pow(10.0, gbHi / 20.0);
+        const double fcLo = p(1), fcHi = fcLo * std::pow(2.0, (gbLo - 20.0 * std::log10(gHi)) / 12.0);
+        double x = std::exp(-2.0 * PI * fcLo / FS);
+        b1lo_ = (float)x; a0lo_ = (float)(gLo * (1.0 - x));
+        x = std::exp(-2.0 * PI * fcHi / FS);
+        b1hi_ = (float)x; a0hi_ = (float)(1.0 - gHi * (1.0 - x)); a1hi_ = (float)-x;
+        gain_ = (float)(1.0 / (1.0 - gHi + gLo));  // a sound in the middle keeps its level in the lows
+    }
+    void run(float* l, float* r, int n) override {
+        if (off_) return;
+        for (int i = 0; i < n; ++i) {
+            const float in[2] = {l[i], r[i]};
+            for (int c = 0; c < 2; ++c) {
+                lo_[c] = a0lo_ * in[c] + b1lo_ * lo_[c];
+                hi_[c] = a0hi_ * in[c] + a1hi_ * x1_[c] + b1hi_ * hi_[c];
+                x1_[c] = in[c];
+            }
+            l[i] = (hi_[0] + lo_[1]) * gain_;
+            r[i] = (hi_[1] + lo_[0]) * gain_;
+        }
+    }
+};
+
+// Every song at the same loudness: it measures loudness the way the ear and the streaming services do (ITU-R
+// BS.1770: K-weighting, 100 ms blocks, quiet blocks left out) over the last few seconds and rides the volume
+// slowly toward the target, so a quiet song comes up and a loud one comes down without the pumping of a
+// compressor. Silence between songs holds the volume where it was; a ceiling catches the start of a loud song.
+class Leveller : public Effect {
+public:
+    Leveller() : Effect(L"leveller", L"Volume Leveller", {{L"Target", -30, -8, -16, L"LUFS"}, {L"Max boost", 0, 20, 10, L"dB"},
+                                                           {L"Max cut", 0, 20, 12, L"dB"}, {L"Speed", 0, 2, 1, L"", CHOICE, SPEEDS}}) {
+        for (int c = 0; c < 2; ++c) { design(shelf_[c], BQ_HSHELF, 1500.0, 0.707, 4.0); design(hp_[c], BQ_HP, 38.0, 0.5); }
+    }
+protected:
+    static const int BLOCK = 4800, MAXB = 60;  // 100 ms blocks, up to 6 s of them
+    BQ shelf_[2], hp_[2];
+    Ceiling top_;
+    double acc_ = 0.0, blocks_[MAXB] = {};
+    int fill_ = 0, at_ = 0, have_ = 0;
+    float gDb_ = 0.0f, wantDb_ = 0.0f;
+    static double lufs(double meanSquare) { return -0.691 + 10.0 * std::log10(std::max(meanSquare, 1e-12)); }
+    void run(float* l, float* r, int n) override {
+        static const int WINDOW[3] = {60, 30, 15};                 // blocks measured: 6 s, 3 s, 1.5 s
+        static const float UP[3] = {0.5f, 1.5f, 4.0f}, DOWN[3] = {2.0f, 5.0f, 10.0f};  // dB a second
+        const int speed = (int)p(3), window = WINDOW[speed];
+        const float target = p(0), boost = p(1), cut = p(2);
+        const float up = UP[speed] / (float)FS, down = DOWN[speed] / (float)FS;
+        for (int i = 0; i < n; ++i) {
+            const float ka = hp_[0].run(shelf_[0].run(l[i])), kb = hp_[1].run(shelf_[1].run(r[i]));
+            acc_ += (double)ka * ka + (double)kb * kb;
+            if (++fill_ == BLOCK) {
+                blocks_[at_] = acc_ / BLOCK;
+                at_ = (at_ + 1) % MAXB; have_ = std::min(have_ + 1, MAXB);
+                acc_ = 0.0; fill_ = 0;
+                // The last blocks louder than -60 LUFS, then those within 10 LU of their mean: the song, not its gaps.
+                const int count = std::min(have_, window);
+                double sum = 0.0; int used = 0;
+                for (int k = 1; k <= count; ++k) { const double b = blocks_[(at_ - k + MAXB) % MAXB]; if (lufs(b) > -60.0) { sum += b; ++used; } }
+                if (used > 0) {
+                    const double gate = lufs(sum / used) - 10.0;
+                    double sum2 = 0.0; int used2 = 0;
+                    for (int k = 1; k <= count; ++k) { const double b = blocks_[(at_ - k + MAXB) % MAXB]; if (lufs(b) > -60.0 && lufs(b) > gate) { sum2 += b; ++used2; } }
+                    // Nothing playing in the newest block: the volume stays where the song left it.
+                    if (used2 > 0 && lufs(blocks_[(at_ - 1 + MAXB) % MAXB]) > -60.0)
+                        wantDb_ = std::clamp(target - (float)lufs(sum2 / used2), -cut, boost);
+                }
+            }
+            gDb_ = wantDb_ > gDb_ ? std::min(wantDb_, gDb_ + up) : std::max(wantDb_, gDb_ - down);
+            const float g = dbGain(gDb_);
+            float a = l[i] * g, b = r[i] * g;
+            top_.run(a, b, 0.891f);  // -1 dB
+            l[i] = a; r[i] = b;
+        }
+    }
+};
+
 // ---------------------------------------------------------------- the list
 
 struct Entry { const wchar_t* id; const wchar_t* name; std::unique_ptr<Effect> (*make)(); };
@@ -668,6 +859,9 @@ template <class T> std::unique_ptr<Effect> makeOne() { return std::make_unique<T
 
 inline const std::vector<Entry>& catalog() {
     static const std::vector<Entry> list = {
+        // The ones for music first: what most people add to a program.
+        {L"enhancer", L"Music Enhancer", makeOne<Enhancer>}, {L"leveller", L"Volume Leveller", makeOne<Leveller>},
+        {L"crossfeed", L"Crossfeed", makeOne<Crossfeed>}, {L"eq8", L"8-Band EQ", makeOne<Eq8>},
         {L"gain", L"Gain", makeOne<Gain>}, {L"stereo", L"Stereo", makeOne<Stereo>}, {L"mixer", L"Channel Mixer", makeOne<ChannelMixer>},
         {L"eq3", L"3-Band EQ", makeOne<Eq3>}, {L"filter", L"Filter", makeOne<Filter>}, {L"compressor", L"Compressor", makeOne<Compressor>},
         {L"limiter", L"Limiter", makeOne<Limiter>}, {L"gate", L"Gate", makeOne<Gate>}, {L"distortion", L"Distortion", makeOne<Distortion>},

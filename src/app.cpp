@@ -319,6 +319,12 @@ struct Shared {
     std::atomic<bool> compOn{MIC_DEFAULTS.compOn};
     std::atomic<bool> micMatch{MIC_DEFAULTS.matchOn};
     std::atomic<int>  compLevel{MIC_DEFAULTS.compLevel};
+    std::atomic<bool> micEqOn{MIC_DEFAULTS.eqOn};
+    std::atomic<int>  micEqLowCut{MIC_DEFAULTS.eqLowCut}, micEqBass{MIC_DEFAULTS.eqBass}, micEqMud{MIC_DEFAULTS.eqMud};
+    std::atomic<int>  micEqPresence{MIC_DEFAULTS.eqPresence}, micEqAir{MIC_DEFAULTS.eqAir};
+    std::atomic<bool> deessOn{MIC_DEFAULTS.deessOn};
+    std::atomic<int>  deess{MIC_DEFAULTS.deess};
+    std::atomic<float> micDeessGr{0.0f};
     // What the chain measures, for its window.
     std::atomic<float> micIn{-120.0f}, micOut{-120.0f}, micAiCut{0.0f}, micVoice{0.0f}, micGateDb{-50.0f}, micCompGr{0.0f};
     std::atomic<bool> micGateOpen{true};
@@ -433,6 +439,9 @@ static iso::MicSettings micSettings() {
     s.gateOn = g.micGateOn.load(); s.gateDb10 = g.micGateDb10.load(); s.gateAuto = g.micGateAuto.load();
     s.compOn = g.compOn.load(); s.compLevel = g.compLevel.load();
     s.matchOn = g.micMatch.load();
+    s.eqOn = g.micEqOn.load(); s.eqLowCut = g.micEqLowCut.load(); s.eqBass = g.micEqBass.load(); s.eqMud = g.micEqMud.load();
+    s.eqPresence = g.micEqPresence.load(); s.eqAir = g.micEqAir.load();
+    s.deessOn = g.deessOn.load(); s.deess = g.deess.load();
     return s;
 }
 // Hands what the mic chain measured to its window.
@@ -445,6 +454,7 @@ static void micPublish(const iso::MicChain& c) {
     g.micGateDb.store(c.meterGateDb.load(r), r);
     g.micGateOpen.store(c.meterGateOpen.load(r), r);
     g.micCompGr.store(c.meterCompGr.load(r), r);
+    g.micDeessGr.store(c.meterDeess.load(r), r);
     for (int i = 0; i < iso::MicChain::WAVE; ++i) g.micWave[i].store(c.wave[i].load(r), r);
     g.micWaveAt.store(c.waveAt.load(r), r);
 }
@@ -2111,6 +2121,7 @@ static COLORREF mixc(COLORREF a, COLORREF b, double t) {
     return RGB(ch(GetRValue(a), GetRValue(b)), ch(GetGValue(a), GetGValue(b)), ch(GetBValue(a), GetBValue(b)));
 }
 
+static void studioRecolour();
 static void lookBrushes() {
     if (brLookBack) { DeleteObject(brLookBack); brLookBack = nullptr; }
     if (brLookPanel) { DeleteObject(brLookPanel); brLookPanel = nullptr; }
@@ -2126,6 +2137,7 @@ static void applyLook() {
     tintLogo(look.accent);
     buildArt();
     tipsColour();
+    studioRecolour();  // the new look has its own colours
 }
 
 // Finished backgrounds are kept for a few sizes and looks, so moving between screens
@@ -2621,6 +2633,7 @@ static int clipLevelFromOld(int old) {
 static const RECT R_CLOSE  = {WIN_W - 34, 5, WIN_W - 8, 29};
 static const RECT R_MIN    = {WIN_W - 64, 5, WIN_W - 38, 29};
 static const RECT R_GEAR   = {WIN_W - 94, 5, WIN_W - 68, 29};
+static const RECT R_TO_NEW = {200, 5, 294, 29};  // back to the new look, when this panel was opened from it
 static RECT R_GRIP   = {WIN_W - 16, WIN_H_FULL - 16, WIN_W - 2, WIN_H_FULL - 2};  // follows WIN_H
 static RECT R_STATUS_LINE = {0, WIN_H_FULL - STATUS_H, WIN_W, WIN_H_FULL};  // follows WIN_H
 
@@ -2650,6 +2663,13 @@ static bool uiBold = false;
 static int uiSize = TEXT_SIZE_BASE;
 static const int NO_PLACE = -99999;
 static bool uiAnim = true, uiTop = false, uiPlace = true, uiHints = true;
+// The new look (src/ui/studio.inl): one window with a sidebar of pages. The classic window stays behind it, hidden.
+static bool uiStudio = false;
+static HWND hStudio = nullptr;
+static bool studioMainWanted = false;  // a page that still lives on the classic window asked for it
+static void studioOpen(int show);
+static void studioUse(bool on);
+static void studioBack();
 static int winX = NO_PLACE, winY = NO_PLACE;
 
 static void applyTopmost(HWND h) {
@@ -5777,6 +5797,7 @@ static void settingsSave() {
     put(L"UiTop", uiTop ? 1 : 0);
     put(L"UiPlace", uiPlace ? 1 : 0);
     put(L"UiHints", uiHints ? 1 : 0);
+    put(L"UiStudio", uiStudio ? 1 : 0);
     for (int a = 0; a < NUM_SHORTCUTS; ++a) put(SHORTCUTS[a].reg, (int)shortcutKey[a]);
     if (winX != NO_PLACE && winY != NO_PLACE) {
         put(L"WinX", winX);
@@ -5802,6 +5823,14 @@ static void settingsSave() {
     put(L"CompOn", g.compOn.load() ? 1 : 0);
     put(L"CompLevel", g.compLevel.load());
     put(L"MicMatch", g.micMatch.load() ? 1 : 0);
+    put(L"MicEqOn", g.micEqOn.load() ? 1 : 0);
+    put(L"MicEqLowCut", g.micEqLowCut.load());
+    put(L"MicEqBass", g.micEqBass.load() + 90);   // -9..+9 dB in tenths, saved as 0..180
+    put(L"MicEqMud", g.micEqMud.load() + 90);
+    put(L"MicEqPresence", g.micEqPresence.load() + 90);
+    put(L"MicEqAir", g.micEqAir.load() + 90);
+    put(L"DeEssOn", g.deessOn.load() ? 1 : 0);
+    put(L"DeEss", g.deess.load());
     put(L"MicMatchSet", 1);
     put(L"VocalLevel", g.gateLevel.load());
     put(L"GateLo", g.gateLo.load() + GATE_TONE_RANGE);
@@ -5885,6 +5914,7 @@ static void settingsLoad() {
     uiTop = get(L"UiTop", 0, 1, 0) != 0;
     uiPlace = get(L"UiPlace", 0, 1, 1) != 0;
     uiHints = get(L"UiHints", 0, 1, 1) != 0;
+    uiStudio = get(L"UiStudio", 0, 1, 0) != 0;
     for (int a = 0; a < NUM_SHORTCUTS; ++a) {
         const DWORD k = (DWORD)get(SHORTCUTS[a].reg, 0, 0x7FFFFFFF, 0);
         shortcutKey[a] = keyUsable(k) ? k : 0;
@@ -5920,6 +5950,14 @@ static void settingsLoad() {
     g.compOn = get(L"CompOn", 0, 1, MIC_DEFAULTS.compOn ? 1 : 0) != 0;
     g.compLevel = get(L"CompLevel", 0, 100, MIC_DEFAULTS.compLevel);
     g.micMatch = get(L"MicMatch", 0, 1, MIC_DEFAULTS.matchOn ? 1 : 0) != 0;
+    g.micEqOn = get(L"MicEqOn", 0, 1, MIC_DEFAULTS.eqOn ? 1 : 0) != 0;
+    g.micEqLowCut = get(L"MicEqLowCut", 20, 200, MIC_DEFAULTS.eqLowCut);
+    g.micEqBass = get(L"MicEqBass", 0, 180, MIC_DEFAULTS.eqBass + 90) - 90;
+    g.micEqMud = get(L"MicEqMud", 0, 180, MIC_DEFAULTS.eqMud + 90) - 90;
+    g.micEqPresence = get(L"MicEqPresence", 0, 180, MIC_DEFAULTS.eqPresence + 90) - 90;
+    g.micEqAir = get(L"MicEqAir", 0, 180, MIC_DEFAULTS.eqAir + 90) - 90;
+    g.deessOn = get(L"DeEssOn", 0, 1, MIC_DEFAULTS.deessOn ? 1 : 0) != 0;
+    g.deess = get(L"DeEss", 0, 100, MIC_DEFAULTS.deess);
     if (get(L"MicMatchSet", 0, 1, 0) == 0) {
         // Once, when Sonar match arrives: the measured Sonar settings, over what the AI mode had before.
         g.aiLevel = MIC_DEFAULTS.aiLevel; g.micGateOn = MIC_DEFAULTS.gateOn; g.micGateDb10 = MIC_DEFAULTS.gateDb10;
@@ -6177,6 +6215,9 @@ static bool settingsFileSave(const std::wstring& path) {
     fprintf(f, "mic_gate_on=%d\nmic_gate_db10=%d\nmic_gate_auto=%d\ncomp_on=%d\ncomp_level=%d\n", g.micGateOn.load() ? 1 : 0, g.micGateDb10.load(),
             g.micGateAuto.load() ? 1 : 0, g.compOn.load() ? 1 : 0, g.compLevel.load());
     fprintf(f, "mic_match=%d\n", g.micMatch.load() ? 1 : 0);
+    fprintf(f, "mic_eq_on=%d\nmic_eq_low_cut=%d\nmic_eq_bass=%d\nmic_eq_mud=%d\nmic_eq_presence=%d\nmic_eq_air=%d\nde_ess_on=%d\nde_ess=%d\n",
+            g.micEqOn.load() ? 1 : 0, g.micEqLowCut.load(), g.micEqBass.load(), g.micEqMud.load(), g.micEqPresence.load(), g.micEqAir.load(),
+            g.deessOn.load() ? 1 : 0, g.deess.load());
     fprintf(f, "vocal_level=%d\ngate_lo=%d\ngate_mid=%d\ngate_hi=%d\ngate_out=%d\n", g.gateLevel.load(), g.gateLo.load(), g.gateMid.load(), g.gateHi.load(), g.gateOut.load());
     fprintf(f, "tone_on=%d\ntone_lo=%d\ntone_mid=%d\ntone_hi=%d\ntone_pad_x=%d\ntone_pad_y=%d\ntone_base_lo=%d\ntone_base_mid=%d\ntone_base_hi=%d\n", g.toneOn.load() ? 1 : 0,
             g.toneLo.load(), g.toneMid.load(), g.toneHi.load(), g.tonePadX.load(), g.tonePadY.load(), g.toneBaseLo.load(), g.toneBaseMid.load(), g.toneBaseHi.load());
@@ -6267,6 +6308,14 @@ static void settingsFileLoad(const std::wstring& path) {
         else if (k == "comp_on")          { g.compOn = iv != 0; g.isoVersion.fetch_add(1); }
         else if (k == "comp_level")       { g.compLevel = clampi(iv, 0, 100); g.isoVersion.fetch_add(1); }
         else if (k == "mic_match")        { g.micMatch = iv != 0; g.isoVersion.fetch_add(1); }
+        else if (k == "mic_eq_on")        { g.micEqOn = iv != 0; g.isoVersion.fetch_add(1); }
+        else if (k == "mic_eq_low_cut")   { g.micEqLowCut = clampi(iv, 20, 200); g.isoVersion.fetch_add(1); }
+        else if (k == "mic_eq_bass")      { g.micEqBass = clampi(iv, -90, 90); g.isoVersion.fetch_add(1); }
+        else if (k == "mic_eq_mud")       { g.micEqMud = clampi(iv, -90, 90); g.isoVersion.fetch_add(1); }
+        else if (k == "mic_eq_presence")  { g.micEqPresence = clampi(iv, -90, 90); g.isoVersion.fetch_add(1); }
+        else if (k == "mic_eq_air")       { g.micEqAir = clampi(iv, -90, 90); g.isoVersion.fetch_add(1); }
+        else if (k == "de_ess_on")        { g.deessOn = iv != 0; g.isoVersion.fetch_add(1); }
+        else if (k == "de_ess")           { g.deess = clampi(iv, 0, 100); g.isoVersion.fetch_add(1); }
         else if (k == "mix_on" && iv) { g.isolate = true; g.isoMode = ISO_VOCAL; g.isoVersion.fetch_add(1); }
         else if (k == "gate_db")   { g.gateLevel = vocalLevelOfThreshold(iv); g.isoVersion.fetch_add(1); }
         else if (k == "gate_level") { g.gateLevel = vocalLevelOfOld(iv); g.isoVersion.fetch_add(1); }
@@ -6907,6 +6956,8 @@ static const RECT R_BH_PLACE = {24, 206, LK_W - 24, 222}, R_BH_HINTS = {24, 252,
 static const int KEY_ROW_Y = 344, KEY_ROW_STEP = 22;
 static const RECT R_HK_DIR = {24, 578, LK_W - 196, 602};
 static const RECT R_HK_DIR_OPEN = {LK_W - 184, 578, LK_W - 108, 602}, R_HK_DIR_PICK = {LK_W - 100, 578, LK_W - 24, 602};
+static const RECT R_BH_STUDIO = {LK_W - 184, 88, LK_W - 24, 112};  // the new look (Studio), from the classic one
+static bool lookStudio = false;
 struct BehaviourOption {
     const RECT* r;
     bool* on;
@@ -7127,6 +7178,7 @@ static void panelHead(HDC dc, const RECT& p, const wchar_t* head, const wchar_t*
 static void paintBehaviour(HDC dc) {
     for (const RECT& p : LK_BEH_PANELS) panel(dc, p, C_PANEL, C_EDGE);
     label(dc, 24, LK_BEH_PANELS[0].top + 8, L"Window", C_GOLD, fntBold);
+    if (!uiStudio) primaryButton(dc, R_BH_STUDIO, ICO_NONE, L"Try the new look", hotLookBtn == 18);
     panelHead(dc, LK_BEH_PANELS[1], L"Hotkeys",
               keyListen >= 0 ? L"press the keys, Backspace for none, Esc to keep" : L"work in every program, even in games");
     for (const BehaviourOption& o : BEHAVIOUR) {
@@ -7319,6 +7371,12 @@ static LRESULT CALLBACK lookProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         if (PtInRect(&R_LK_OK, p) || PtInRect(&R_LK_CLOSE, p)) { lookResult = 1; return 0; }
         if (lookTab == 1) {
+            if (!uiStudio && PtInRect(&R_BH_STUDIO, p)) {
+                // Switched once this box closes: the new look opens and the classic window hides.
+                lookStudio = true;
+                lookResult = 1;
+                return 0;
+            }
             for (int i = 0; i < 4; ++i)
                 if (PtInRect(BEHAVIOUR[i].r, p)) { behaviourFlip(h, i); return 0; }
             if (PtInRect(&R_HK_DIR_OPEN, p)) {
@@ -7422,7 +7480,7 @@ static LRESULT CALLBACK lookProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else if (PtInRect(&R_LK_TAB_BEH, p)) bt = 15;
         else if (PtInRect(&R_LK_OK, p)) bt = 3;
         else if (PtInRect(&R_LK_CLOSE, p)) bt = 13;
-        else if (lookTab != 0) bt = PtInRect(&R_HK_DIR_OPEN, p) ? 16 : (PtInRect(&R_HK_DIR_PICK, p) ? 17 : -1);
+        else if (lookTab != 0) bt = PtInRect(&R_HK_DIR_OPEN, p) ? 16 : (PtInRect(&R_HK_DIR_PICK, p) ? 17 : (!uiStudio && PtInRect(&R_BH_STUDIO, p) ? 18 : -1));
         else if (PtInRect(&R_LK_BG, p)) bt = 0;
         else if (wallBmp && PtInRect(&R_LK_CLR, p)) bt = 1;
         else if (PtInRect(&R_LK_RESET, p)) bt = 2;
@@ -7518,9 +7576,15 @@ static void pickLook(HWND owner) {
     hLook = nullptr;
     SetForegroundWindow(owner);
     settingsSave();
-    applyWindowAlpha(owner);
-    applyTopmost(owner);
-    refreshLook(owner);
+    // The look is the classic window's, also when the box was opened from the new look.
+    applyWindowAlpha(hwndMain);
+    applyTopmost(hwndMain);
+    if (hStudio) applyTopmost(hStudio);
+    refreshLook(hwndMain);
+    if (lookStudio) {
+        lookStudio = false;
+        studioUse(true);
+    }
 }
 
 static int clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -8102,6 +8166,8 @@ static void micReset(HWND h) {
     g.aiOn = MIC_DEFAULTS.aiOn; g.nrBgOn = MIC_DEFAULTS.bgOn; g.nrImpactOn = MIC_DEFAULTS.impactOn;
     g.micGateOn = MIC_DEFAULTS.gateOn; g.micGateAuto = MIC_DEFAULTS.gateAuto; g.compOn = MIC_DEFAULTS.compOn;
     g.micMatch = MIC_DEFAULTS.matchOn;
+    g.micEqOn = MIC_DEFAULTS.eqOn; g.micEqLowCut = MIC_DEFAULTS.eqLowCut; g.micEqBass = MIC_DEFAULTS.eqBass; g.micEqMud = MIC_DEFAULTS.eqMud;
+    g.micEqPresence = MIC_DEFAULTS.eqPresence; g.micEqAir = MIC_DEFAULTS.eqAir; g.deessOn = MIC_DEFAULTS.deessOn; g.deess = MIC_DEFAULTS.deess;
     micChanged(h);
 }
 // Noise reduction only works while the AI is off, as in Sonar.
@@ -10892,7 +10958,7 @@ static void paintPick(HDC dc, const RECT& rc) {
         const COLORREF ink = here ? C_DIM : hot ? C_GOLD : C_TEXT;
         mixText(dc, RECT{x, r.top, r.right - 74, r.bottom}, p.name.c_str(), ink, fntUI);
         if (at >= 0) {
-            const std::wstring where = here ? L"\x2713 here" : L"Audio " + std::to_wstring(at + 1);
+            const std::wstring where = here ? L"\x2713 here" : gMix.strips[at].title;
             mixText(dc, RECT{r.right - 72, r.top, r.right - 8, r.bottom}, where.c_str(), C_DIM, fntUI, DT_RIGHT);
         }
     }
@@ -10950,6 +11016,7 @@ static LRESULT CALLBACK pickProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         mixSave();
         pickClose();
         if (hMixer) InvalidateRect(hMixer, nullptr, FALSE);
+        if (hStudio) InvalidateRect(hStudio, nullptr, FALSE);
         return 0;
     }
     case WM_KEYDOWN:
@@ -10967,7 +11034,11 @@ static LRESULT CALLBACK pickProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-static void mixAddProgram(HWND h, int i) {
+static void mixAddProgramAt(HWND h, int i, const RECT& add);
+static void mixAddProgram(HWND h, int i) { mixAddProgramAt(h, i, mixAddRect(i)); }
+
+// The program picker for strip i, opened under `add` (design coordinates of h).
+static void mixAddProgramAt(HWND h, int i, const RECT& add) {
     pickClose();
     std::vector<clip::Program> progs = clip::listPrograms();
     std::sort(progs.begin(), progs.end(), [](const clip::Program& a, const clip::Program& b) { return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0; });
@@ -10981,7 +11052,6 @@ static void mixAddProgram(HWND h, int i) {
     pickTop = 0;
     pickHot = -1;
     // Open under the strip's Add button, kept on the screen.
-    const RECT add = mixAddRect(i);
     POINT at = {sc(add.left), sc(add.bottom + 2)};
     ClientToScreen(h, &at);
     const RECT wa = workAreaOf(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST));
@@ -11092,7 +11162,7 @@ static void showMenuList(HWND owner, const RECT& at, std::vector<std::wstring> i
     menuTop = 0;
     menuHot = -1;
     RECT shown = at;
-    layoutOut(shown);
+    if (layoutWindow(owner)) layoutOut(shown);
     POINT pt = {sc(shown.left), sc(shown.bottom + 2)};
     ClientToScreen(owner, &pt);
     const RECT wa = workAreaOf(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST));
@@ -11202,6 +11272,12 @@ static LRESULT CALLBACK plugWindowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         DestroyWindow(h);
         plugSave();  // its settings as the window leaves them
         if (hwndMain) InvalidateRect(hwndMain, nullptr, FALSE);
+        if (hStudio) InvalidateRect(hStudio, nullptr, FALSE);
+        return 0;
+    case WM_DESTROY:
+        // Gone with the window it belongs to (the new look closing) rather than closed by hand.
+        KillTimer(h, 1);
+        if (p && p->editorWindow == h) { p->closeEditor(); p->editorWindow = nullptr; }
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
@@ -11324,6 +11400,7 @@ static LRESULT CALLBACK fxWindowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE:
+    case WM_DESTROY:
         return plugWindowProc(h, m, w, l);
     }
     return DefWindowProcW(h, m, w, l);
@@ -11340,8 +11417,10 @@ static void plugToggleWindow(vst2::Plugin* p) {
     if (!p->hasEditor()) { plugNote = p->title() + L" has no window of its own"; return; }
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     const bool own = p->builtin() != nullptr;
+    // With the new look showing, the window belongs to it (stays above it, goes with it).
+    const bool studio = hStudio && IsWindowVisible(hStudio);
     HWND w = CreateWindowExW(0, own ? L"PixlFx" : L"PixlPlugin", (p->title() + L" - Pixl").c_str(), style, CW_USEDEFAULT, CW_USEDEFAULT, 400, 300,
-                             hwndMain, nullptr, GetModuleHandleW(nullptr), nullptr);
+                             studio ? hStudio : hwndMain, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!w) return;
     SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)p);
     if (HICON ic = (HICON)SendMessageW(hwndMain, WM_GETICON, ICON_SMALL, 0)) SendMessageW(w, WM_SETICON, ICON_SMALL, (LPARAM)ic);
@@ -11351,13 +11430,24 @@ static void plugToggleWindow(vst2::Plugin* p) {
     if (own) { ew = sc(FX_W); eh = sc(fxH(p->builtin())); }
     RECT r{0, 0, ew, eh};
     AdjustWindowRectEx(&r, style, FALSE, 0);
-    // Beside Pixl's window, on the same screen.
+    // Beside Pixl's window, on the same screen. In the new look: always in the same place, over the channel faders at
+    // the top (the effects stay in sight below), each one more a little lower and to the right.
     RECT mw;
-    GetWindowRect(hwndMain, &mw);
-    const RECT wa = workAreaOf(MonitorFromWindow(hwndMain, MONITOR_DEFAULTTONEAREST));
+    GetWindowRect(studio ? hStudio : hwndMain, &mw);
+    const RECT wa = workAreaOf(MonitorFromWindow(studio ? hStudio : hwndMain, MONITOR_DEFAULTTONEAREST));
     const int ww = r.right - r.left, wh = r.bottom - r.top;
     int x = mw.right + 8, y = mw.top + 40;
-    if (x + ww > wa.right) x = std::max((int)wa.left, (int)mw.left - ww - 8);
+    if (studio) {
+        int open = 0;
+        for (plugins::Chain* c : {&gPlugVoice, &gPlugProg})
+            for (int i = 0; i < c->size(); ++i)
+                if (vst2::Plugin* q = c->at(i); q && q != p && q->editorWindow) ++open;
+        POINT at = {sc(330) + sc(28) * open, sc(46) + sc(28) * open};
+        ClientToScreen(hStudio, &at);
+        x = std::min((int)at.x, (int)mw.right - ww - sc(10));
+        y = at.y;
+    } else if (x + ww > wa.right) x = std::max((int)wa.left, (int)mw.left - ww - 8);
+    x = std::max((int)wa.left, std::min(x, (int)wa.right - ww));
     y = std::max((int)wa.top, std::min(y, (int)wa.bottom - wh));
     SetWindowPos(w, nullptr, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
     ShowWindow(w, SW_SHOW);
@@ -11572,7 +11662,7 @@ static LRESULT CALLBACK mixerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int db10;
             { std::lock_guard<std::mutex> lk(gMix.mx); db10 = gMix.strips[i].db10; }
             double typed = 0.0;
-            const std::wstring title = L"Audio " + std::to_wstring(i + 1) + L" volume (dB)";
+            const std::wstring title = gMix.strips[i].title + L" volume (dB)";
             if (askNumber(h, title, db10 / 10.0, 1, mixer::MIN_DB10 / 10.0, mixer::MAX_DB10 / 10.0, typed)) {
                 {
                     std::lock_guard<std::mutex> lk(gMix.mx);
@@ -11669,6 +11759,7 @@ static void openMixer(HWND owner) {
     boxShow(hMixer);
     SetForegroundWindow(hMixer);
 }
+
 
 static const int REC_Y = CLIP_Y + 296;
 static const RECT R_REC_PANEL = {CX + 12, REC_Y, CX + COL_W - 12, CLIP_Y + CLIP_H};
@@ -13145,6 +13236,7 @@ static void drawTitleBar(HDC dc, const RECT& rc, bool mainView) {
         iconButton(dc, R_SETUP_DEL, ICO_TRASH, nullptr, isHot(R_SETUP_DEL), !curSetup.empty());
     }
     iconButton(dc, R_GEAR, ICO_LOOK, nullptr, isHot(R_GEAR));
+    if (uiStudio) primaryButton(dc, R_TO_NEW, ICO_NONE, L"New look", isHot(R_TO_NEW));
     iconButton(dc, R_MIN, ICO_MIN, nullptr, isHot(R_MIN));
     {
         const double k = hotLevelFor(R_CLOSE, isHot(R_CLOSE));
@@ -14362,6 +14454,7 @@ static void zoomDragTo(HWND h) {
 
 static std::vector<const RECT*> hoverables() {
     std::vector<const RECT*> v = {&R_CLOSE, &R_MIN, &R_GEAR, &rCredit, &R_GRIP};
+    if (uiStudio) v.push_back(&R_TO_NEW);
     if (cablePanel) {
         const int view = cableView();
         v.push_back(&R_CB_RUN);
@@ -15292,8 +15385,15 @@ static void updTidy() {
     }).detach();
 }
 
+// The new look (after everything it calls: the recorder, the setups, the updater).
+#include "ui/studio.inl"
+
 static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
+    case WM_WINDOWPOSCHANGING:
+        // With the new look open this window stays hidden unless a page of it was asked for (studioShowMain).
+        if (uiStudio && hStudio && !studioMainWanted) ((WINDOWPOS*)l)->flags &= ~SWP_SHOWWINDOW;
+        break;
     case WM_PAINT:
         ticksLive = true;
         paint(h);
@@ -15429,6 +15529,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (PtInRect(&R_CLOSE, p)) { PostMessageW(h, WM_CLOSE, 0, 0); return 0; }
         if (PtInRect(&R_MIN, p)) { SendMessageW(h, WM_SYSCOMMAND, SC_MINIMIZE, 0); return 0; }
         if (PtInRect(&R_GEAR, p)) { hotLeave(h); pickLook(h); return 0; }
+        if (uiStudio && PtInRect(&R_TO_NEW, p)) { hotLeave(h); studioBack(); return 0; }
         if (PtInRect(&rCredit, p)) { hotLeave(h); showAbout(h); return 0; }
         if (cablePanel) {
             const int view = cableView();
@@ -16245,6 +16346,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE:
+        // One window at a time: closing this one (also when the new look stepped aside for it) closes Pixl.
+        if (hStudio) DestroyWindow(hStudio);
+        studioMainWanted = false;
         if (zoomDrag) {
             zoomDone(h);
             ReleaseCapture();
@@ -16325,7 +16429,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static bool glitchCapture(const MSG& m) {
-    if (!glitchListening || !m.hwnd || GetAncestor(m.hwnd, GA_ROOT) != hwndMain) return false;
+    if (!glitchListening || !m.hwnd) return false;
+    const HWND root = GetAncestor(m.hwnd, GA_ROOT);
+    if (root != hwndMain && (!hStudio || root != hStudio)) return false;  // the classic window or the new look
     UINT vk = 0;
     switch (m.message) {
     case WM_KEYDOWN:
@@ -16534,6 +16640,14 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
             wchar_t lay[64];
             if (GetEnvironmentVariableW(L"PIXL_LAYOUT", lay, 64)) RegSetKeyValueW(home, L"Settings", L"Layout", REG_SZ, lay, (DWORD)((wcslen(lay) + 1) * sizeof(wchar_t)));
             if (GetEnvironmentVariableW(L"PIXL_NOWALL", nullptr, 0) > 0) RegSetKeyValueW(home, L"Settings", L"Wallpaper", REG_SZ, L"", sizeof(wchar_t));
+            // PIXL_STUDIO=<page>: the new look, on that page (0 Mixer, 7 Settings).
+            wchar_t studio[8];
+            if (GetEnvironmentVariableW(L"PIXL_STUDIO", studio, 8)) {
+                const DWORD on = 1;
+                RegSetKeyValueW(home, L"Settings", L"UiStudio", REG_DWORD, &on, sizeof on);
+                uiStudio = true;
+                studioPage = std::max(0, std::min((int)SP_COUNT - 1, _wtoi(studio)));
+            }
             // PIXL_PLUGINS "tab|path|path...": the Plugins panel on that tab (0 voice, 1 program) with those effects on it.
             static wchar_t plugs[4096];
             if (GetEnvironmentVariableW(L"PIXL_PLUGINS", plugs, 4096)) {
@@ -16561,7 +16675,10 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
         single = CreateMutexW(nullptr, FALSE, L"Local\\Pixl.Running");
         const DWORD err = GetLastError();
         const bool taken = single ? err == ERROR_ALREADY_EXISTS : err == ERROR_ACCESS_DENIED;
-        const HWND other = FindWindowW(L"PixlWnd", nullptr);
+        // Whichever window is showing: the new look, or the classic one (also when the new look stepped aside for it).
+        HWND other = FindWindowW(L"PixlStudio", nullptr);
+        const HWND classic = FindWindowW(L"PixlWnd", nullptr);
+        if (!other || (!IsWindowVisible(other) && classic && IsWindowVisible(classic))) other = classic;
         if (other && !updated) {
             if (IsIconic(other)) ShowWindow(other, SW_RESTORE);
             ShowWindow(other, SW_SHOW);
@@ -16653,6 +16770,8 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
         fw.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&fw);
         WNDCLASSW tr{}; tr.lpfnWndProc = scaledProc<trimProc>; tr.hInstance = hi; tr.lpszClassName = L"PixlTrim";
         tr.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&tr);
+        WNDCLASSW st{}; st.style = CS_DBLCLKS; st.lpfnWndProc = scaledProc<studioProc>; st.hInstance = hi; st.lpszClassName = L"PixlStudio";
+        st.hCursor = LoadCursor(nullptr, IDC_ARROW); st.hIcon = hAppIcon; RegisterClassW(&st);
     }
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;
@@ -16784,7 +16903,8 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
 #else
     previewMic();
 #endif
-    windowOpen(hwnd, nShow);
+    if (uiStudio) studioOpen(nShow);  // the new look: the classic window stays hidden behind it
+    else windowOpen(hwnd, nShow);
 #ifdef PIXL_PREVIEW
     // PIXL_OPEN=mic opens the Noise Cancellation window.
     {

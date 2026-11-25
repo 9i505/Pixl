@@ -1,6 +1,7 @@
 #pragma once
 // The mic chain, laid out like SteelSeries Sonar's: AI noise cancellation (RNNoise), or classic noise reduction
-// (Background and Impact) while the AI is off; then a noise gate and a compressor.
+// (Background and Impact) while the AI is off; then a noise gate, the mic EQ, a compressor, Sonar match and a de-esser
+// (the GoXLR's mic page has the same gate, EQ, compressor and de-esser).
 //
 // Every branch runs all the time at the same delay (30 ms: 10 ms of buffering, 20 ms inside RNNoise), and switching
 // between them crossfades, so turning anything on or off never clicks and never moves the voice in time.
@@ -28,6 +29,16 @@ struct MicSettings {
     bool compOn = false;
     int compLevel = 50;        // 0..100, shown as 0.00..1.00
     bool matchOn = false;      // Sonar match: the tone, evenness and level SteelSeries Sonar gave this mic
+    // Mic EQ: a low cut and four bands, for a clearer voice.
+    bool eqOn = false;
+    int eqLowCut = 80;         // Hz, 20 (off) .. 200: rumble, desk thumps and breath pops below it go
+    int eqBass = 0;            // tenths of a dB, -90..+90: low shelf at 150 Hz (body)
+    int eqMud = -20;           // 350 Hz bell (boxiness, "cardboard")
+    int eqPresence = 30;       // 4 kHz bell (words stand out)
+    int eqAir = 20;            // high shelf at 10 kHz (open, crisp)
+    // De-esser: softens harsh "s", "sh" and "t" sounds.
+    bool deessOn = false;
+    int deess = 50;            // 0..100
 };
 
 // Sonar match: the tone curve, leveller and output level measured from a recording of the same voice through a raw
@@ -43,7 +54,7 @@ struct ToneMatch {
     struct Bq {
         float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
         float run(float x) { const float y = b0 * x + z1; z1 = b1 * x - a1 * y + z2; z2 = b2 * x - a2 * y; return y; }
-        // RBJ cookbook: 0 peak, 1 low shelf, 2 high shelf, 3 low pass.
+        // RBJ cookbook: 0 peak, 1 low shelf, 2 high shelf, 3 low pass, 4 high pass.
         void design(int kind, double fs, double hz, double gainDb, double q) {
             const double A = std::pow(10.0, gainDb / 40.0), w = 2.0 * 3.14159265358979323846 * hz / fs, cw = std::cos(w), sw = std::sin(w);
             double B0, B1, B2, A0, A1, A2;
@@ -53,6 +64,9 @@ struct ToneMatch {
             } else if (kind == 3) {
                 const double al = sw / (2.0 * q);
                 B0 = (1 - cw) / 2; B1 = 1 - cw; B2 = (1 - cw) / 2; A0 = 1 + al; A1 = -2 * cw; A2 = 1 - al;
+            } else if (kind == 4) {
+                const double al = sw / (2.0 * q);
+                B0 = (1 + cw) / 2; B1 = -(1 + cw); B2 = (1 + cw) / 2; A0 = 1 + al; A1 = -2 * cw; A2 = 1 - al;
             } else {
                 const double s2 = 2.0 * std::sqrt(A) * (sw / 2.0) * std::sqrt(2.0);  // 2 sqrt(A) alpha, shelf slope 1
                 if (kind == 1) {
@@ -94,6 +108,55 @@ struct ToneMatch {
     }
 };
 
+// Mic EQ: a 12 dB/octave low cut, a bass shelf, a cut for boxiness, a presence lift and air.
+struct MicEq {
+    ToneMatch::Bq b[5];
+    void configure(const MicSettings& s, double fs) {
+        b[0].design(4, fs, std::max(20, s.eqLowCut), 0.0, 0.707);
+        b[1].design(1, fs, 150.0, s.eqBass / 10.0, 0.707);
+        b[2].design(0, fs, 350.0, s.eqMud / 10.0, 1.2);
+        b[3].design(0, fs, 4000.0, s.eqPresence / 10.0, 0.9);
+        b[4].design(2, fs, std::min(10000.0, 0.4 * fs), s.eqAir / 10.0, 0.707);
+    }
+    void reset() { for (ToneMatch::Bq& q : b) q.z1 = q.z2 = 0.f; }
+    float run(float x) { for (ToneMatch::Bq& q : b) x = q.run(x); return x; }
+};
+
+// De-esser: the band above 5 kHz is split off (lo + hi is the input exactly) and turned down only while it is loud
+// next to the whole voice, which is what an "s" is; vowels and quiet breath are left alone.
+struct DeEsser {
+    ToneMatch::Bq hp1, hp2, det;
+    float envHi = 0.f, envAll = 0.f, gain = 1.f, fs = 48000.f, ratio = 0.3f, floor = 0.3f, lastGr = 0.f;
+    float atk = 0.f, rel = 0.f, gAtk = 0.f, gRel = 0.f;
+    void configure(int amount, double rate) {
+        fs = (float)rate;
+        hp1.design(4, rate, 5000.0, 0.0, 0.541);   // two together: a 4th-order Butterworth split
+        hp2.design(4, rate, 5000.0, 0.0, 1.307);
+        det.design(0, rate, 7000.0, 6.0, 1.0);     // the detector leans on where "s" lives
+        const float a = std::max(0, std::min(100, amount)) / 100.f;
+        ratio = 0.55f - 0.4f * a;                   // how much of the voice the high band may be before it is pulled down
+        floor = std::pow(10.f, -(4.f + 10.f * a) / 20.f);   // the most it takes off: 4 dB .. 14 dB
+        atk = 1.f / (0.0008f * fs); rel = 1.f / (0.040f * fs);
+        gAtk = 1.f / (0.0015f * fs); gRel = 1.f / (0.060f * fs);
+    }
+    void reset() { hp1.z1 = hp1.z2 = hp2.z1 = hp2.z2 = det.z1 = det.z2 = 0.f; envHi = envAll = 0.f; gain = 1.f; }
+    float run(float x, bool on) {
+        const float hi = hp2.run(hp1.run(x));
+        const float d = det.run(hi);
+        const float eh = d * d, ea = x * x;
+        envHi += (eh > envHi ? atk : rel) * (eh - envHi);
+        envAll += (ea > envAll ? atk : rel) * (ea - envAll);
+        float target = 1.f;
+        if (on && envHi > 1e-7f) {
+            const float over = envHi / (ratio * envAll + 1e-12f);
+            if (over > 1.f) target = std::max(floor, 1.f / std::sqrt(over));
+        }
+        gain += (target < gain ? gAtk : gRel) * (target - gain);
+        lastGr = -20.f * std::log10(std::max(gain, 1e-6f));
+        return x - (1.f - gain) * hi;
+    }
+};
+
 struct MicChain {
     static const int FRAME = 480;             // RNNoise's 10 ms at 48 kHz
     static const int NFFT = 256, HOP = 128;   // the classic noise reduction
@@ -105,7 +168,7 @@ struct MicChain {
     double fs = 48000.0;
 
     // Meters for the window (written by the audio thread).
-    std::atomic<float> meterIn{-120.f}, meterOut{-120.f}, meterAiCut{0.f}, meterVoice{0.f}, meterGateDb{-50.f}, meterCompGr{0.f};
+    std::atomic<float> meterIn{-120.f}, meterOut{-120.f}, meterAiCut{0.f}, meterVoice{0.f}, meterGateDb{-50.f}, meterCompGr{0.f}, meterDeess{0.f};
     std::atomic<bool> meterGateOpen{false};
     std::atomic<float> wave[WAVE];
     std::atomic<int> waveAt{0};
@@ -133,6 +196,12 @@ struct MicChain {
         set.impact = clampi(set.impact, 0, 100);
         set.compLevel = clampi(set.compLevel, 0, 100);
         set.gateDb10 = clampi(set.gateDb10, -800, 0);
+        set.eqLowCut = clampi(set.eqLowCut, 20, 200);
+        set.eqBass = clampi(set.eqBass, -90, 90); set.eqMud = clampi(set.eqMud, -90, 90);
+        set.eqPresence = clampi(set.eqPresence, -90, 90); set.eqAir = clampi(set.eqAir, -90, 90);
+        set.deess = clampi(set.deess, 0, 100);
+        micEq.configure(set, fs);
+        deEsser.configure(set.deess, fs);
         // AI: Min still takes 10 dB off the noise, Max all the AI can.
         const double t = set.aiLevel / 100.0;
         aiResidual = set.aiLevel >= 100 ? 0.f : (float)std::pow(10.0, -(10.0 + 40.0 * t * t) / 20.0);
@@ -166,6 +235,8 @@ struct MicChain {
         compEnv = 0.f;
         tone.reset();
         wMatch = set.matchOn ? 1.f : 0.f;
+        micEq.reset(); deEsser.reset();
+        wEq = set.eqOn ? 1.f : 0.f;
         inSm = outSm = -120.f; cutSm = 0.f;
     }
 
@@ -203,6 +274,9 @@ private:
     float compThr = -20.f, compRatio = 3.f, compMakeup = 0.f;
     ToneMatch tone;
     float wMatch = 0.f;
+    MicEq micEq;
+    DeEsser deEsser;
+    float wEq = 0.f;
     float wAi = 1.f, wNr = 0.f, envFast = 1e-10f, envSlow = 1e-10f, hpX = 0.f, hpY = 0.f;
     long long evStart = 0;
     float evPeak = 0.f, evBase = 0.f, envMid = 1e-10f, voiceNear = 0.f, fullMid = 1e-10f, fullSlow = 1e-10f, fullBase = 0.f;
@@ -239,10 +313,13 @@ private:
             const float wDry = std::max(0.f, 1.f - wAi - wNr);
             float y = wAi * aiOut + wNr * nrOut + wDry * dry;
             y = gate(y);
+            // The EQ and Sonar match always run, so switching them crossfades.
+            wEq = toward(wEq, set.eqOn ? 1.f : 0.f, step);
+            y = wEq * micEq.run(y) + (1.f - wEq) * y;
             y = compress(y);
-            // Sonar match: always running, so switching it crossfades.
             wMatch = toward(wMatch, set.matchOn ? 1.f : 0.f, step);
             y = wMatch * tone.run(y) + (1.f - wMatch) * y;
+            y = deEsser.run(y, set.deessOn);
             if (y > 1.f) y = 1.f; else if (y < -1.f) y = -1.f;
             out[i] = y;
             pOut += y * y;
@@ -264,6 +341,7 @@ private:
         meterGateDb.store(set.gateAuto ? autoThreshold() : set.gateDb10 / 10.f, std::memory_order_relaxed);
         meterGateOpen.store(!set.gateOn || gateGain > 0.5f, std::memory_order_relaxed);
         meterCompGr.store(!set.compOn ? 0.f : set.matchOn ? tone.lastGr : lastGr, std::memory_order_relaxed);
+        meterDeess.store(deEsser.lastGr, std::memory_order_relaxed);
         const int w = waveAt.load(std::memory_order_relaxed);
         wave[w].store(peak, std::memory_order_relaxed);
         waveAt.store((w + 1) % WAVE, std::memory_order_relaxed);
